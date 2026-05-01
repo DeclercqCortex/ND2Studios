@@ -1,0 +1,14 @@
+{
+    "_comment": "Copy to hpc/config/myconfig.json and fill in your details. See hpc/README.md for field descriptions.",
+    "netid": "YOUR_NETID",
+    "group": "YOUR_PI_GROUP",
+    "cluster": "puma",
+    "partition": "standard",
+    "python_module": "python/3.11/3.11.4",
+    "cpus": 4,
+    "walltime": "04:00:00",
+    "repo_path": "~/my-project",
+    "venv_path": "~/my-project-env",
+    "results_path": "/groups/YOUR_PI_GROUP/results",
+    "max_concurrent": 10
+}

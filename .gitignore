@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Results (generated data)
+results/
+
+# Logs
+slurm_logs/
+*.log
+
+# User configs (contain personal info)
+User.json
+hpc/config/*.json
+!hpc/config/template.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# HPC generated files
+hpc/scripts/trial_list.txt
+hpc/scripts/*_batch*.slurm
+
+# Office temp files
+~$*
