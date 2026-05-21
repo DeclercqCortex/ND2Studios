@@ -11,8 +11,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QComboBox, QCheckBox, QSizePolicy, QPushButton,
 )
-from PySide6.QtCore import Qt, Signal, QPoint
-from PySide6.QtGui import QImage, QPixmap, QPainter
+from PySide6.QtCore import Qt, Signal, QPoint, QRectF, QPointF
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QPolygonF
 
 from nd2studios.core.settings import Settings
 
@@ -174,9 +174,21 @@ class ZoomToolbar(QWidget):
 class ImageCanvas(QLabel):
     """QLabel that displays a scaled QPixmap with overlay painting and click reporting."""
 
-    clicked = Signal(float, float)   # image-space y, x
-    zoom_changed = Signal(float)     # current zoom multiplier (1.0 = fit)
-    pan_mode_changed = Signal(bool)  # True if pan tool is active
+    clicked = Signal(float, float)            # image-space y, x
+    zoom_changed = Signal(float)              # current zoom multiplier (1.0 = fit)
+    pan_mode_changed = Signal(bool)           # True if pan tool is active
+    crop_rect_selected = Signal(int, int, int, int)  # x, y, w, h (image pixels)
+    # Manual-mask drawing — emitted on mouse release.
+    # (mode, vertices) where vertices is List[Tuple[float, float]] of (iy, ix)
+    # in image pixel space. For "rect" and "ellipse" the list has the two
+    # bounding-box corners; for "polygon" it is the recorded freehand path
+    # (the consumer closes the loop).
+    shape_drawn = Signal(str, list)
+    # Vertex drag in edit mode — (vertex_index, iy, ix). Emitted while the
+    # mouse is held; on release the canvas emits ``edit_committed()`` so the
+    # consumer can persist or coalesce.
+    vertex_moved = Signal(int, float, float)
+    edit_committed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -201,6 +213,25 @@ class ImageCanvas(QLabel):
         self._pan_start_offset = None
         self.pan_mode = False  # instance attribute, not class
         self.setMouseTracking(True)
+
+        # Crop mode state
+        self._crop_mode: bool = False
+        self._crop_drag_start: Optional[Tuple[float, float]] = None  # (iy, ix)
+        self._crop_drag_end: Optional[Tuple[float, float]] = None    # (iy, ix)
+        self._crop_dragging: bool = False
+
+        # Draw mode state (manual-mask shape drawing).
+        # _draw_mode is one of: None, "rect", "ellipse", "polygon".
+        self._draw_mode: Optional[str] = None
+        self._draw_drag_start: Optional[Tuple[float, float]] = None  # (iy, ix)
+        self._draw_drag_end: Optional[Tuple[float, float]] = None    # (iy, ix)
+        self._draw_dragging: bool = False
+        self._poly_vertices: List[Tuple[float, float]] = []  # [(iy, ix), ...]
+
+        # Vertex-edit mode — when ``_edit_vertices`` is not None, draggable
+        # handles are painted at each vertex and the user can move them.
+        self._edit_vertices: Optional[List[Tuple[float, float]]] = None
+        self._edit_drag_idx: Optional[int] = None
 
     def set_image(self, rgb_array: np.ndarray):
         """Set image from (H, W, 3) uint8 array."""
@@ -258,6 +289,104 @@ class ImageCanvas(QLabel):
             self._pan_start_offset = None
         self.pan_mode_changed.emit(enabled)
 
+    def set_crop_mode(self, enabled: bool) -> None:
+        """Toggle crop selection tool. Deactivates pan, draw, and edit modes."""
+        self._crop_mode = bool(enabled)
+        self._crop_drag_start = None
+        self._crop_drag_end = None
+        self._crop_dragging = False
+        if enabled:
+            self.set_pan_mode(False)
+            self._clear_draw_state()
+            self._draw_mode = None
+            self._edit_vertices = None
+            self._edit_drag_idx = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_draw_mode(self, mode: Optional[str]) -> None:
+        """Set the active shape-drawing tool, or None to disable.
+
+        Valid modes: "rect", "ellipse", "polygon".  Activating a draw mode
+        deactivates pan, crop, and vertex-edit so the tools remain mutually
+        exclusive.
+        """
+        if mode not in (None, "rect", "ellipse", "polygon"):
+            return
+        self._clear_draw_state()
+        self._draw_mode = mode
+        if mode is not None:
+            self.set_pan_mode(False)
+            # Clear any in-flight crop without re-entering set_crop_mode (which
+            # would zero out the draw cursor we are about to apply).
+            self._crop_mode = False
+            self._crop_drag_start = None
+            self._crop_drag_end = None
+            self._crop_dragging = False
+            # Drawing a new shape and editing existing vertices are mutually
+            # exclusive — clear edit state.
+            self._edit_vertices = None
+            self._edit_drag_idx = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def _clear_draw_state(self) -> None:
+        """Reset all draw-tool in-flight state without changing the active mode."""
+        self._draw_drag_start = None
+        self._draw_drag_end = None
+        self._draw_dragging = False
+        self._poly_vertices = []
+
+    def set_edit_vertices(self, vertices: Optional[List[Tuple[float, float]]]) -> None:
+        """Enter vertex-edit mode showing draggable handles at ``vertices``.
+
+        ``vertices`` is a list of ``(iy, ix)`` pairs in image-pixel space.
+        Pass ``None`` to leave edit mode.  Activating edit mode deactivates
+        pan, crop, and the draw tools so the modes remain mutually exclusive.
+        """
+        if vertices is None:
+            self._edit_vertices = None
+            self._edit_drag_idx = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            return
+        # Store a copy so external mutation never leaks back through the
+        # canvas state.
+        self._edit_vertices = [(float(y), float(x)) for y, x in vertices]
+        self._edit_drag_idx = None
+        # Mutex with the other tools.
+        self.set_pan_mode(False)
+        self._crop_mode = False
+        self._crop_drag_start = None
+        self._crop_drag_end = None
+        self._crop_dragging = False
+        self._draw_mode = None
+        self._clear_draw_state()
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    def _hit_test_vertex(self, wx: float, wy: float) -> Optional[int]:
+        """Return the index of the vertex nearest ``(wx, wy)`` in widget
+        coords, if within ``HANDLE_HIT_PX`` widget pixels. Otherwise None."""
+        if not self._edit_vertices:
+            return None
+        # Hit radius scales with the device — 10 widget pixels works on both
+        # zoomed-in and zoomed-out views.
+        hit_radius_sq = 10.0 * 10.0
+        best_idx: Optional[int] = None
+        best_d2 = hit_radius_sq
+        for i, (iy, ix) in enumerate(self._edit_vertices):
+            vx, vy = self.image_to_widget(iy, ix)
+            d2 = (vx - wx) ** 2 + (vy - wy) ** 2
+            if d2 <= best_d2:
+                best_d2 = d2
+                best_idx = i
+        return best_idx
+
     def center_on(self, img_y: float, img_x: float):
         """Pan so the given image coordinate is at the center of the widget."""
         self._pan_x = img_x - self._img_w / 2
@@ -281,6 +410,66 @@ class ImageCanvas(QLabel):
         painter.drawPixmap(ox, oy, sw, sh, self._source_pixmap)
         if self._overlay_fn:
             self._overlay_fn(painter, self._scale, ox, oy, pw, ph)
+        if self._crop_drag_start and self._crop_drag_end:
+            start_iy, start_ix = self._crop_drag_start
+            end_iy, end_ix = self._crop_drag_end
+            wx0, wy0 = self.image_to_widget(start_iy, start_ix)
+            wx1, wy1 = self.image_to_widget(end_iy, end_ix)
+            pen = QPen(QColor(255, 220, 0), 1.5, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(255, 220, 0, 40)))
+            painter.drawRect(QRectF(
+                min(wx0, wx1), min(wy0, wy1),
+                abs(wx1 - wx0), abs(wy1 - wy0),
+            ))
+        # In-progress draw-mode preview — cyan dashed to distinguish from crop.
+        if self._draw_mode is not None and self._draw_dragging:
+            pen = QPen(QColor(0, 220, 255), 1.5, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(0, 220, 255, 40)))
+            if (self._draw_mode in ("rect", "ellipse")
+                    and self._draw_drag_start is not None
+                    and self._draw_drag_end is not None):
+                sy, sx = self._draw_drag_start
+                ey, ex = self._draw_drag_end
+                wx0, wy0 = self.image_to_widget(sy, sx)
+                wx1, wy1 = self.image_to_widget(ey, ex)
+                rect = QRectF(
+                    min(wx0, wx1), min(wy0, wy1),
+                    abs(wx1 - wx0), abs(wy1 - wy0),
+                )
+                if self._draw_mode == "rect":
+                    painter.drawRect(rect)
+                else:
+                    painter.drawEllipse(rect)
+            elif self._draw_mode == "polygon" and len(self._poly_vertices) >= 2:
+                poly = QPolygonF()
+                for vy, vx in self._poly_vertices:
+                    wx, wy = self.image_to_widget(vy, vx)
+                    poly.append(QPointF(wx, wy))
+                # Draw the path open during the drag — the closing edge appears
+                # on release, when the consumer rasterizes the closed polygon.
+                painter.drawPolyline(poly)
+        # Vertex-edit handles — draw the polygon outline + circles at each
+        # vertex so the user can grab any handle to deform the mask locally.
+        if self._edit_vertices:
+            outline = QPolygonF()
+            widget_pts: List[Tuple[float, float]] = []
+            for iy, ix in self._edit_vertices:
+                wx, wy = self.image_to_widget(iy, ix)
+                widget_pts.append((wx, wy))
+                outline.append(QPointF(wx, wy))
+            # Closed outline so the user sees the shape they're editing.
+            pen = QPen(QColor(0, 220, 255), 1.5, Qt.PenStyle.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolygon(outline)
+            # Handles.
+            painter.setBrush(QBrush(QColor(255, 255, 255)))
+            painter.setPen(QPen(QColor(0, 140, 200), 1.5))
+            for i, (wx, wy) in enumerate(widget_pts):
+                r = 5.5 if i == self._edit_drag_idx else 4.0
+                painter.drawEllipse(QPointF(wx, wy), r, r)
         painter.end()
 
     def wheelEvent(self, event):
@@ -290,6 +479,37 @@ class ImageCanvas(QLabel):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._edit_vertices is not None:
+                idx = self._hit_test_vertex(event.pos().x(), event.pos().y())
+                if idx is not None:
+                    self._edit_drag_idx = idx
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                    self.update()
+                    event.accept()
+                    return
+                # Click in empty space inside edit mode is a no-op — neither
+                # a pixel click nor a pan start, since that would be confusing.
+                event.accept()
+                return
+            if self._draw_mode is not None:
+                iy, ix = self.widget_to_image(event.pos().x(), event.pos().y())
+                if self._draw_mode in ("rect", "ellipse"):
+                    self._draw_drag_start = (iy, ix)
+                    self._draw_drag_end = (iy, ix)
+                    self._draw_dragging = True
+                else:  # polygon
+                    self._poly_vertices = [(iy, ix)]
+                    self._draw_dragging = True
+                self.update()
+                event.accept()
+                return
+            if self._crop_mode:
+                iy, ix = self.widget_to_image(event.pos().x(), event.pos().y())
+                self._crop_drag_start = (iy, ix)
+                self._crop_drag_end = (iy, ix)
+                self._crop_dragging = True
+                event.accept()
+                return
             if self.pan_mode:
                 # Pan mode: start dragging
                 self._panning = True
@@ -312,6 +532,38 @@ class ImageCanvas(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if (self._edit_vertices is not None
+                and self._edit_drag_idx is not None):
+            iy, ix = self.widget_to_image(event.pos().x(), event.pos().y())
+            # Clamp inside the image so dragged vertices don't escape the frame.
+            iy = max(0.0, min(float(self._img_h - 1), iy))
+            ix = max(0.0, min(float(self._img_w - 1), ix))
+            self._edit_vertices[self._edit_drag_idx] = (iy, ix)
+            self.vertex_moved.emit(self._edit_drag_idx, iy, ix)
+            self.update()
+            event.accept()
+            return
+        if self._draw_mode is not None and self._draw_dragging:
+            iy, ix = self.widget_to_image(event.pos().x(), event.pos().y())
+            if self._draw_mode in ("rect", "ellipse"):
+                self._draw_drag_end = (iy, ix)
+            else:  # polygon — append vertex only when the cursor has moved far
+                # enough to keep the vertex count bounded (~ every 2 image pixels).
+                if self._poly_vertices:
+                    py, px = self._poly_vertices[-1]
+                    if (iy - py) * (iy - py) + (ix - px) * (ix - px) >= 4.0:
+                        self._poly_vertices.append((iy, ix))
+                else:
+                    self._poly_vertices.append((iy, ix))
+            self.update()
+            event.accept()
+            return
+        if self._crop_mode and self._crop_dragging:
+            iy, ix = self.widget_to_image(event.pos().x(), event.pos().y())
+            self._crop_drag_end = (iy, ix)
+            self.update()
+            event.accept()
+            return
         if self._panning and self._pan_start is not None:
             dx = event.pos().x() - self._pan_start.x()
             dy = event.pos().y() - self._pan_start.y()
@@ -321,6 +573,64 @@ class ImageCanvas(QLabel):
             event.accept()
 
     def mouseReleaseEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._edit_drag_idx is not None):
+            self._edit_drag_idx = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.edit_committed.emit()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._draw_dragging \
+                and self._draw_mode is not None:
+            mode = self._draw_mode
+            vertices: List[Tuple[float, float]] = []
+            if mode in ("rect", "ellipse"):
+                if self._draw_drag_start is not None and self._draw_drag_end is not None:
+                    sy, sx = self._draw_drag_start
+                    ey, ex = self._draw_drag_end
+                    # Require a minimum drag distance — a single click is not a
+                    # shape, and emitting a zero-size bounding box would create
+                    # an empty mask label.
+                    if abs(ex - sx) > 3 or abs(ey - sy) > 3:
+                        vertices = [(sy, sx), (ey, ex)]
+            else:  # polygon
+                if len(self._poly_vertices) >= 3:
+                    vertices = list(self._poly_vertices)
+            self._clear_draw_state()
+            self.update()
+            if vertices:
+                self.shape_drawn.emit(mode, vertices)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._crop_dragging:
+            self._crop_dragging = False
+            if self._crop_drag_start and self._crop_drag_end:
+                start_iy, start_ix = self._crop_drag_start
+                end_iy, end_ix = self._crop_drag_end
+                dx = abs(end_ix - start_ix)
+                dy = abs(end_iy - start_iy)
+                if dx > 3 or dy > 3:
+                    # Significant drag — emit crop rect
+                    x = max(0, int(min(start_ix, end_ix)))
+                    y = max(0, int(min(start_iy, end_iy)))
+                    w = max(1, int(abs(end_ix - start_ix)))
+                    h = max(1, int(abs(end_iy - start_iy)))
+                    w = min(w, self._img_w - x)
+                    h = min(h, self._img_h - y)
+                    self._crop_drag_start = None
+                    self._crop_drag_end = None
+                    self.update()
+                    self.crop_rect_selected.emit(x, y, w, h)
+                else:
+                    # Single click — emit clicked as normal
+                    iy, ix = self._crop_drag_start
+                    self._crop_drag_start = None
+                    self._crop_drag_end = None
+                    self.update()
+                    if 0 <= ix < self._img_w and 0 <= iy < self._img_h:
+                        self.clicked.emit(iy, ix)
+            event.accept()
+            return
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
             self._panning = False
         super().mouseReleaseEvent(event)

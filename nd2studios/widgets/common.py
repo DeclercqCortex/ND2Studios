@@ -66,6 +66,8 @@ class ParamEditor(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._specs: List[ParamSpec] = []
         self._widgets: Dict[str, QWidget] = {}
+        # Hidden params store their value here — no widget, no form row.
+        self._hidden_values: Dict[str, Any] = {}
 
     def set_params(self, specs: List[ParamSpec]):
         """Replace the form with new parameter specifications."""
@@ -76,8 +78,14 @@ class ParamEditor(QWidget):
                 item.widget().deleteLater()
         self._specs = specs
         self._widgets = {}
+        self._hidden_values = {}
 
         for spec in specs:
+            if spec.param_type == "hidden":
+                # Internal-state slot — populated via set_values(), read via
+                # get_values(). Never rendered.
+                self._hidden_values[spec.name] = spec.default
+                continue
             widget = self._make_widget(spec)
             self._widgets[spec.name] = widget
             label = QLabel(spec.label)
@@ -131,8 +139,11 @@ class ParamEditor(QWidget):
         self.params_changed.emit(self.get_values())
 
     def get_values(self) -> Dict[str, Any]:
-        vals = {}
+        vals: Dict[str, Any] = {}
         for spec in self._specs:
+            if spec.param_type == "hidden":
+                vals[spec.name] = self._hidden_values.get(spec.name, spec.default)
+                continue
             w = self._widgets.get(spec.name)
             if w is None:
                 continue
@@ -150,11 +161,14 @@ class ParamEditor(QWidget):
 
     def set_values(self, values: Dict[str, Any]):
         for name, val in values.items():
-            w = self._widgets.get(name)
-            if w is None:
-                continue
             spec = next((s for s in self._specs if s.name == name), None)
             if spec is None:
+                continue
+            if spec.param_type == "hidden":
+                self._hidden_values[name] = val
+                continue
+            w = self._widgets.get(name)
+            if w is None:
                 continue
             w.blockSignals(True)
             if spec.param_type == "float":

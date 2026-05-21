@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import traceback
+from typing import ClassVar, List
 
 from PySide6.QtCore import QThread, Signal
 
@@ -17,9 +18,16 @@ class BaseWorker(QThread):
     finished = Signal(object)     # result object
     error = Signal(str)           # error message
 
+    # Class-level registry keeps a Python reference to every running worker so
+    # Python's GC cannot destroy the QThread wrapper while the OS thread is
+    # still executing — the source of "QThread: Destroyed while thread is still
+    # running" warnings.
+    _running: ClassVar[List[BaseWorker]] = []
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._cancelled = False
+        BaseWorker._running.append(self)
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -41,6 +49,11 @@ class BaseWorker(QThread):
                 self.finished.emit(result)
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+        finally:
+            try:
+                BaseWorker._running.remove(self)
+            except ValueError:
+                pass
 
     def run_task(self):
         raise NotImplementedError

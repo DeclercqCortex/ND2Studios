@@ -24,7 +24,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from nd2studios.backend.exporters.composite_exporter import (
-    CHANNEL_COLORS, _composite_frame, _percentile_uint8,
+    CHANNEL_COLORS, ImageAdjustments, _composite_frame, _percentile_uint8,
 )
 
 
@@ -146,6 +146,54 @@ def _draw_overlays(
     return np.asarray(img)
 
 
+# Largest edge libx264 can comfortably encode at Level 6.2 with the
+# default 4-frame DPB and B-frames. Anything bigger gets a "frame MB
+# size > level limit" error and produces an unreadable file. The
+# stitched-panorama outputs from ND2Studios easily blow past this
+# (e.g. 11264 × 6144), so we transparently scale down for MP4 export.
+MAX_MP4_LONGEST_EDGE = 3840
+
+
+def _downscale_for_mp4(frames: List[np.ndarray]) -> Tuple[List[np.ndarray], float]:
+    """Resize frames so the longest edge fits H.264 high-tier limits.
+
+    Returns ``(frames_out, scale)`` where ``scale`` is the linear scale
+    factor that was applied (1.0 if no resize was needed).  Dimensions
+    are rounded to even numbers so libx264's yuv420p chroma subsampling
+    is happy.
+    """
+    if not frames:
+        return frames, 1.0
+    h, w = frames[0].shape[:2]
+    longest = max(h, w)
+    if longest <= MAX_MP4_LONGEST_EDGE:
+        # Still enforce even dimensions for yuv420p — pad by one black
+        # row/col if needed rather than cropping.
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            out: List[np.ndarray] = []
+            for f in frames:
+                padded = np.zeros((h + pad_h, w + pad_w, f.shape[2]),
+                                   dtype=f.dtype)
+                padded[:h, :w] = f
+                out.append(padded)
+            return out, 1.0
+        return frames, 1.0
+
+    scale = MAX_MP4_LONGEST_EDGE / float(longest)
+    new_w = max(2, int(round(w * scale)) // 2 * 2)
+    new_h = max(2, int(round(h * scale)) // 2 * 2)
+    from PIL import Image as _PILImage
+    out: List[np.ndarray] = []
+    for f in frames:
+        img = _PILImage.fromarray(f)
+        out.append(np.asarray(
+            img.resize((new_w, new_h), _PILImage.LANCZOS)
+        ))
+    return out, scale
+
+
 def _format_seconds(s: float) -> str:
     s = max(0.0, s)
     h = int(s // 3600)
@@ -164,7 +212,10 @@ def export_movie(
     options: Optional[MovieOptions] = None,
     pixel_size_um: float = 1.0,
     frame_timestamps_s: Optional[np.ndarray] = None,
+    lut_settings: Optional[Dict[str, Tuple[float, float, float]]] = None,
+    image_adjustments: Optional[ImageAdjustments] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Write an MP4 / GIF time-lapse with optional overlays.
 
@@ -179,10 +230,12 @@ def export_movie(
     frame_timestamps_s : per-frame timestamps in seconds. If None and the
         options ask for a timestamp overlay, falls back to
         `options.timestamp_dt_seconds`.
+    lut_settings : {channel_name: (lo, hi, gamma)} contrast bounds. When
+        provided they override the default percentile auto-stretch so the
+        movie matches what the user sees in the viewer.
     progress_cb : 0–100.
     """
-    import imageio.v3 as iio
-    import imageio  # for writer-style access if iio.v3 doesn't expose it
+    import imageio
 
     if not channels:
         raise ValueError("export_movie: no channels to export")
@@ -200,29 +253,114 @@ def export_movie(
 
     channel_names = list(channels.keys())
 
-    # Use the legacy writer for fine-grained per-frame control. imageio
-    # auto-selects ffmpeg for mp4 and pillow for gif.
-    writer_kwargs: Dict = {"fps": opts.fps}
-    if codec in {"mp4", "mov", "m4v"}:
-        writer_kwargs.update(quality=8, codec="libx264", macro_block_size=1)
+    # Render all frames first so we can use format-specific writers that
+    # don't suffer from imageio's plugin auto-routing (which can silently
+    # pick tifffile and then fail on the 'fps' write kwarg).
+    rendered: List[np.ndarray] = []
+    for t in range(n):
+        frame_dict = {name: arr[t] for name, arr in channels.items()}
+        rgb = _composite_frame(frame_dict, colors, enabled, lut_settings,
+                               image_adjustments=image_adjustments)
+        rgb_with_overlays = _draw_overlays(
+            rgb,
+            t_index=t,
+            opts=opts,
+            pixel_size_um=pixel_size_um,
+            channel_colors=colors,
+            channel_enabled=enabled,
+            channel_names=channel_names,
+            frame_timestamps=(
+                np.asarray(frame_timestamps_s)
+                if frame_timestamps_s is not None else None
+            ),
+        )
+        rendered.append(rgb_with_overlays)
+        if progress_cb is not None and (t % 4 == 0 or t == n - 1):
+            progress_cb(int((t + 1) / n * 90))
 
-    with imageio.get_writer(filepath, **writer_kwargs) as writer:
-        for t in range(n):
-            frame_dict = {name: arr[t] for name, arr in channels.items()}
-            rgb = _composite_frame(frame_dict, colors, enabled)
-            rgb_with_overlays = _draw_overlays(
-                rgb,
-                t_index=t,
-                opts=opts,
-                pixel_size_um=pixel_size_um,
-                channel_colors=colors,
-                channel_enabled=enabled,
-                channel_names=channel_names,
-                frame_timestamps=(
-                    np.asarray(frame_timestamps_s)
-                    if frame_timestamps_s is not None else None
-                ),
+    if codec == "gif":
+        from PIL import Image as _PILImage
+        duration_ms = max(1, int(1000.0 / opts.fps))
+        pil_frames = [_PILImage.fromarray(f) for f in rendered]
+        pil_frames[0].save(
+            filepath,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=duration_ms,
+            loop=0,
+            optimize=False,
+        )
+    elif codec in {"mp4", "mov", "m4v"}:
+        try:
+            import imageio_ffmpeg as _iffmpeg
+        except ImportError as exc:
+            raise RuntimeError(
+                "imageio-ffmpeg is required for MP4 export. "
+                "Install it with: pip install imageio-ffmpeg"
+            ) from exc
+        # Cap the longest edge so the H.264 encoder doesn't bail with
+        # "frame MB size > level limit" on stitched-panorama outputs.
+        # Returns the input list unchanged when no resize is needed but
+        # still pads odd dimensions to even for yuv420p.
+        in_h, in_w = rendered[0].shape[:2]
+        rendered, scale = _downscale_for_mp4(rendered)
+        h, w = rendered[0].shape[:2]
+        if (in_h, in_w) != (h, w):
+            msg = (
+                f"MP4: downscaled {in_w}×{in_h} → {w}×{h} "
+                f"(scale {scale:.3f}) — H.264 Level 6.2 frame-MB cap"
             )
-            writer.append_data(rgb_with_overlays)
-            if progress_cb is not None and (t % 4 == 0 or t == n - 1):
-                progress_cb(int((t + 1) / n * 100))
+            if status_cb is not None:
+                status_cb(msg)
+            else:
+                # No status callback wired: at least make it visible in
+                # the console so the user sees the downscale happened.
+                import sys as _sys
+                print(f"[ND2Studios] {msg}", file=_sys.stderr)
+        # Hard guard: if for any reason the downscale failed to bring
+        # the longest edge under the H.264 frame-MB ceiling, fail loudly
+        # here with an actionable error rather than handing libx264 an
+        # input it'll reject (producing an unplayable MP4).
+        max_mb_per_dim = MAX_MP4_LONGEST_EDGE // 16
+        mb_w = (w + 15) // 16
+        mb_h = (h + 15) // 16
+        if mb_w > max_mb_per_dim or mb_h > max_mb_per_dim:
+            raise RuntimeError(
+                f"MP4 export: frame {w}×{h} ({mb_w}×{mb_h} macroblocks) "
+                f"exceeds H.264 Level 6.2 limits even after downscale. "
+                f"Use GIF export, the TIFF Z-stack exporter, or pre-crop "
+                f"the canvas."
+            )
+        # Level 6.2 is libx264's highest supported H.264 level; combined
+        # with refs=2 and no B-frames it covers ~3840 px on the longest
+        # edge within the DPB macroblock budget.
+        # Level 6.2 is libx264's highest supported H.264 level; combined
+        # with refs=2 and no B-frames it covers ~3840 px on the longest
+        # edge within the DPB macroblock budget.
+        writer_gen = _iffmpeg.write_frames(
+            filepath.replace("%", "%%"),
+            size=(w, h),
+            fps=opts.fps,
+            pix_fmt_in="rgb24",
+            pix_fmt_out="yuv420p",
+            codec="libx264",
+            macro_block_size=1,
+            output_params=[
+                "-crf", "18",
+                "-preset", "medium",
+                "-level", "6.2",
+                "-refs", "2",
+                "-bf", "0",
+            ],
+        )
+        writer_gen.send(None)
+        for frame in rendered:
+            writer_gen.send(frame.astype(np.uint8).tobytes())
+        writer_gen.close()
+    elif codec in {"tif", "tiff"}:
+        imageio.mimsave(filepath, rendered)
+    else:
+        imageio.mimsave(filepath, rendered, fps=opts.fps)
+
+    if progress_cb is not None:
+        progress_cb(100)

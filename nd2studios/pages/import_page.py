@@ -24,12 +24,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QScrollArea, QSpinBox, QTableWidget,
+    QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
 from nd2studios.core.settings import Settings
+from nd2studios.pages.reconstruct_dialog import ReconstructDialog
 from nd2studios.pages.stitch_dialog import StitchDialog
 from nd2studios.widgets.multi_axis_viewer import MultiAxisViewer
 from nd2studios.workers.load_worker import LoadWorker
@@ -85,13 +86,16 @@ class ImportPage(QWidget):
 
     # ── UI ──
     def _build_ui(self) -> None:
-        outer = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(12)
+        outer.setSpacing(0)
+
+        _splitter = QSplitter(Qt.Horizontal)
+        _splitter.setChildrenCollapsible(False)
 
         # Left column: file + metadata + intrinsic channel info.
         left = QWidget()
-        left.setFixedWidth(420)
+        left.setMinimumWidth(200)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(8)
@@ -103,6 +107,12 @@ class ImportPage(QWidget):
         self.btn_browse.setObjectName("primaryBtn")
         self.btn_browse.clicked.connect(self._on_browse)
         fl.addWidget(self.btn_browse)
+        self.btn_reconstruct = QPushButton("Reconstruct from multiple files…")
+        self.btn_reconstruct.setToolTip(
+            "Pick several ND2 or TIFF files and chain them along an axis "
+            "(T / M / Z / C) into a single virtual volume.")
+        self.btn_reconstruct.clicked.connect(self._on_reconstruct)
+        fl.addWidget(self.btn_reconstruct)
         self.lbl_filepath = QLabel("No file loaded.")
         self.lbl_filepath.setWordWrap(True)
         self.lbl_filepath.setStyleSheet(
@@ -166,7 +176,7 @@ class ImportPage(QWidget):
         ll.addLayout(btn_row)
 
         ll.addStretch(1)
-        outer.addWidget(left)
+        _splitter.addWidget(left)
 
         # Right column: multi-axis viewer.
         right = QWidget()
@@ -174,11 +184,17 @@ class ImportPage(QWidget):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(4)
         rl.addWidget(QLabel("Preview", objectName="sectionHeader"))
-        self.viewer = MultiAxisViewer(self)
+        self.viewer = MultiAxisViewer(self, show_tile_preview=True)
         self.viewer.coords_changed.connect(self._on_coords_changed)
         self.viewer.channels_changed.connect(self._on_channels_changed)
+        # Click on the corner tile preview opens the stitch dialog.
+        self.viewer.stitch_requested.connect(self._on_stitch)
         rl.addWidget(self.viewer, stretch=1)
-        outer.addWidget(right, stretch=1)
+        _splitter.addWidget(right)
+        _splitter.setStretchFactor(0, 0)
+        _splitter.setStretchFactor(1, 1)
+        _splitter.setSizes([420, 900])
+        outer.addWidget(_splitter, stretch=1)
 
     # ── Page lifecycle ──
     def on_activated(self) -> None:
@@ -215,8 +231,24 @@ class ImportPage(QWidget):
         exp.m_index = int(m)
         exp.z_view_index = int(z)
         exp.z_view_mode = self.combo_zproj.currentText()
+        # Rebuild lazy channels so any Z-mode or M-position change made after
+        # "Confirm Import" (e.g. user tweaks the combo then switches tabs) is
+        # always reflected in exp._raw_channels before Recipe/Export sees it.
+        if exp._raw_volume is not None:
+            channels = exp._raw_volume.all_channels_as_lazy(
+                m=exp.m_index,
+                z_mode=exp.z_view_mode,
+                z_index=exp.z_view_index,
+            )
+            enabled_names = [
+                name for name, cfg in (exp.channel_display or {}).items()
+                if cfg.get("enabled", True)
+            ]
+            if enabled_names:
+                channels = {n: channels[n] for n in enabled_names if n in channels}
+            exp._raw_channels = channels
 
-    # ── Browse ──
+    # ── Browse (single file) ──
     def _on_browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Open ND2 or TIFF", "",
@@ -226,11 +258,36 @@ class ImportPage(QWidget):
             return
         self._filepath = path
         self.lbl_filepath.setText(path)
+        self._start_load_worker(filepaths=[path], chain_axis="Z")
 
+    # ── Reconstruct (multi-file with chosen chain axis, V1.28+) ──
+    def _on_reconstruct(self) -> None:
+        dialog = ReconstructDialog(parent=self)
+        if dialog.exec() != ReconstructDialog.Accepted:
+            return
+        paths = dialog.filepaths()
+        axis = dialog.chain_axis()
+        mapping = dialog.chain_mapping()
+        if len(paths) < 2:
+            return
+        self._filepath = paths[0]
+        first = os.path.basename(paths[0])
+        self.lbl_filepath.setText(
+            f"{len(paths)} files chained on {axis}: {first} … "
+            f"+{len(paths) - 1} more"
+        )
+        self._start_load_worker(
+            filepaths=paths, chain_axis=axis, chain_mapping=mapping,
+        )
+
+    def _start_load_worker(self, filepaths: List[str], chain_axis: str,
+                            chain_mapping=None) -> None:
         self.btn_confirm.setEnabled(False)
         self.btn_stitch.setEnabled(False)
         self._loader = LoadWorker(
-            path,
+            filepaths=filepaths,
+            chain_axis=chain_axis,
+            chain_mapping=chain_mapping,
             z_projection=self.combo_zproj.currentText(),
             t_stride=int(self.spin_t_stride.value()),
         )
@@ -272,12 +329,15 @@ class ImportPage(QWidget):
             # Wire the viewer to the volume so M/T/Z scrolling works.
             volume = payload.get("volume")
             if volume is not None:
+                # Pass stage XY positions so the corner tile-preview
+                # overlay can render.
                 self.viewer.set_volume(
                     volume,
                     channel_display=exp.channel_display,
                     z_mode=self.combo_zproj.currentText(),
                     z_index=exp.z_view_index,
                     m=exp.m_index, t=0, z=exp.z_view_index,
+                    stage_xy_um=list(meta.get("stage_xy_um") or []),
                 )
             else:
                 # TIFF path: no volume, just channels.
@@ -341,12 +401,20 @@ class ImportPage(QWidget):
                 rows.append(("Mean dt", f"{dt:.3f} s"))
 
         stage = meta.get("stage_xy_um") or []
+        n_m = int(meta.get("n_multipoints", 1))
         if stage:
             xs = [p[0] for p in stage]
             ys = [p[1] for p in stage]
             rows.append(("Stage XY range",
                          f"X {min(xs):.1f}…{max(xs):.1f}  "
                          f"Y {min(ys):.1f}…{max(ys):.1f} µm"))
+        # Tile source diagnostic — combines the metadata reader's
+        # status with the layout widget's actual decision (V1.4 + V1.7).
+        layout_source = meta.get("stage_layout_source") or ""
+        if n_m > 1 or layout_source:
+            tile_msg = self._tile_source_summary(meta, stage, n_m, layout_source)
+            if tile_msg:
+                rows.append(("Tile source", tile_msg))
 
         loops = meta.get("loops") or []
         if loops:
@@ -358,6 +426,54 @@ class ImportPage(QWidget):
         for i, (k, v) in enumerate(rows):
             self.meta_table.setItem(i, 0, QTableWidgetItem(k))
             self.meta_table.setItem(i, 1, QTableWidgetItem(str(v)))
+
+    def _tile_source_summary(self, meta: Dict[str, Any],
+                              stage: List[Tuple[float, float]],
+                              n_m: int, layout_source: str) -> str:
+        """One-line summary for the metadata-table 'Tile source' row.
+
+        Combines the metadata reader's status (V1.4) with the layout
+        widget's expansion decision (V1.7) so the user sees both at a
+        glance, e.g.:
+
+        - "68 of 68 from stage XY"
+        - "68 multipoints → 17 unique cells × 4 visits → 8 × 17 layout"
+        - "grid fallback (no stage XY metadata)"
+        """
+        if layout_source == "missing":
+            return f"grid fallback ({n_m} tiles, no stage XY metadata)"
+        if layout_source.startswith("partial:"):
+            return (f"{len(stage)} of {n_m} from stage XY · "
+                    f"grid fallback for the rest")
+        if not stage or not layout_source.startswith("stage_xy"):
+            return ""
+
+        # Have valid stage XY — ask the layout algorithm what it decided.
+        try:
+            from nd2studios.backend.exporters.stitch_exporter import (
+                compute_tile_layout,
+            )
+            tile_h = int(meta.get("height", 0)) or 1
+            tile_w = int(meta.get("width", 0)) or 1
+            px_um = float(meta.get("pixel_size_um", 1.0))
+            layout = compute_tile_layout(
+                list(stage),
+                pixel_size_um=px_um,
+                tile_h=tile_h, tile_w=tile_w,
+            )
+        except Exception:
+            return f"{len(stage)} of {n_m} from stage XY"
+
+        if layout.source == "physical":
+            cols = layout.n_phys_cols
+            rows = layout.n_phys_rows
+            partial = f"{len(stage)} of {n_m}" if len(stage) < n_m else str(len(stage))
+            method = layout_source.split(":")[-1] if ":" in layout_source else ""
+            method_label = f" via {method}" if method else ""
+            return (f"{partial} multipoints · physical layout "
+                    f"{cols} cols × {rows} rows "
+                    f"({layout.canvas_w} × {layout.canvas_h} px{method_label})")
+        return f"grid fallback ({n_m} tiles)"
 
     def _populate_info_rows(self, meta: Dict[str, Any]) -> None:
         for row in self._info_rows:
@@ -396,7 +512,6 @@ class ImportPage(QWidget):
         exp.channel_display = self.viewer.channel_state()
 
     def _on_z_mode_changed(self, _mode: str) -> None:
-        # Update the viewer's z_mode without rebuilding the volume.
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
@@ -408,6 +523,7 @@ class ImportPage(QWidget):
             channel_display=exp.channel_display,
             z_mode=self.combo_zproj.currentText(),
             z_index=int(z), m=int(m), t=int(t), z=int(z),
+            stage_xy_um=list((exp.nd2_metadata or {}).get("stage_xy_um") or []),
         )
 
     # ── Stitch ──
@@ -436,29 +552,18 @@ class ImportPage(QWidget):
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
-        if not exp._raw_channels:
+        if not exp._raw_channels and exp._raw_volume is None:
             QMessageBox.information(self, "Nothing to import",
                                     "Browse for an ND2 / TIFF file first.")
             return
 
+        # save_to_experiment rebuilds channels from volume with current z_mode.
         self.save_to_experiment(exp)
 
-        # Rebuild per-channel proxies for the chosen M and Z mode so the
-        # recipe / export pipeline operates on what the user is seeing.
-        if exp._raw_volume is not None:
-            channels = exp._raw_volume.all_channels_as_lazy(
-                m=exp.m_index,
-                z_mode=exp.z_view_mode,
-                z_index=exp.z_view_index,
-            )
-            # Drop disabled channels.
-            enabled_names = [
-                name for name, cfg in (exp.channel_display or {}).items()
-                if cfg.get("enabled", True)
-            ]
-            if enabled_names:
-                channels = {n: channels[n] for n in enabled_names if n in channels}
-            exp._raw_channels = channels
+        if not exp._raw_channels:
+            QMessageBox.information(self, "Nothing to import",
+                                    "Browse for an ND2 / TIFF file first.")
+            return
 
         self.main_window.exp_manager.set_status("imported")
         self.main_window.set_status_text("Imported.")

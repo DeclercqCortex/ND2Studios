@@ -35,7 +35,7 @@ from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QButtonGroup, QFileDialog, QGraphicsDropShadowEffect, QHBoxLayout,
     QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QSizeGrip, QStackedWidget, QVBoxLayout, QWidget,
+    QSizeGrip, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from nd2studios.core.experiment_manager import (
@@ -112,8 +112,13 @@ class MainWindow(QMainWindow):
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(0)
 
-        body_layout.addWidget(self._build_sidebar())
-        body_layout.addWidget(self._build_content_area(), stretch=1)
+        self._body_splitter = QSplitter(Qt.Horizontal)
+        self._body_splitter.setChildrenCollapsible(False)
+        self._body_splitter.addWidget(self._build_sidebar())
+        self._body_splitter.addWidget(self._build_content_area())
+        self._body_splitter.setStretchFactor(0, 0)
+        self._body_splitter.setStretchFactor(1, 1)
+        body_layout.addWidget(self._body_splitter, stretch=1)
 
         bg_layout.addWidget(body, stretch=1)
 
@@ -164,8 +169,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setObjectName("leftMenuBg")
-        sidebar.setFixedWidth(Settings.SIDEBAR_EXPANDED_WIDTH)
-        sidebar.setMinimumWidth(Settings.SIDEBAR_EXPANDED_WIDTH)
+        sidebar.setMinimumWidth(Settings.SIDEBAR_COLLAPSED_WIDTH)
         self._sidebar = sidebar
 
         layout = QVBoxLayout(sidebar)
@@ -239,11 +243,17 @@ class MainWindow(QMainWindow):
         from nd2studios.pages.import_page import ImportPage
         from nd2studios.pages.recipe_page import RecipePage
         from nd2studios.pages.export_page import ExportPage
+        from nd2studios.pages.analysis_page import AnalysisPage
+        from nd2studios.pages.results_page import ResultsPage
+        from nd2studios.pages.batch_page import BatchPage
 
         page_classes = {
             "import": ImportPage,
             "recipe": RecipePage,
             "export": ExportPage,
+            "analysis": AnalysisPage,
+            "results": ResultsPage,
+            "batch": BatchPage,
         }
         self._stack = QStackedWidget()
         for key, _icon, _title, _tooltip in Settings.PAGES:
@@ -382,11 +392,24 @@ class MainWindow(QMainWindow):
         anim2.setEndValue(end)
         anim2.setEasingCurve(QEasingCurve.InOutQuart)
 
+        anim.finished.connect(self._on_sidebar_anim_done)
         anim.start()
         anim2.start()
         # Keep refs alive until they finish.
         self._sidebar_animation = anim
         self._sidebar_animation_2 = anim2
+
+    def _on_sidebar_anim_done(self) -> None:
+        if self._sidebar_expanded:
+            # Remove upper bound so the splitter handle can grow the sidebar past 240 px.
+            self._sidebar.setMaximumWidth(16777215)
+        self._reset_active_viewer_zoom()
+
+    def _reset_active_viewer_zoom(self) -> None:
+        page = self.pages.get(self._current_page_key)
+        viewer = getattr(page, "viewer", None)
+        if viewer and hasattr(viewer, "canvas"):
+            viewer.canvas.reset_zoom()
 
     # ── Navigation ─────────────────────────────────────────────────
     def _navigate(self, page_key: str) -> None:

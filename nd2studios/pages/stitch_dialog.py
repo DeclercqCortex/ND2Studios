@@ -1,43 +1,49 @@
 """
-``StitchDialog`` — opened from the Import page to stitch multipoint
-tiles into a single TIFF stack without modifying the original file.
+``StitchDialog`` (V1.3) — opened from the Import page to stitch
+multipoint tiles into a single TIFF stack.
 
-Layout:
+Layout
+------
 
     ┌──────────────────────────────────────────────┐
     │  Stitch M positions                          │
-    │  ┌──────── layout preview ──────────┐        │
-    │  │ [MplCanvas with tile rectangles] │        │
-    │  └──────────────────────────────────┘        │
+    │  ┌──────── interactive layout ───────┐        │
+    │  │  TileLayoutWidget(mode=select)    │        │
+    │  │  click tiles to toggle inclusion  │        │
+    │  └───────────────────────────────────┘        │
+    │  [Select all]  [Select none]   N/M selected   │
     │                                              │
-    │  Tile selection:  [☑0 ☑1 ☑2 …]  [All] [None] │
-    │  Channels:         [☑DAPI ☑GFP ☐TRITC] [colors] │
-    │  Z mode:           [max ▾]   Z slice: [- 0 -] │
-    │  Output:           [/path/to/out.tif] [Browse]│
+    │  Channels:        [☑DAPI ☑GFP ☐TRITC] [colors]│
+    │  Z mode:          [max ▾]   Z slice: [- 0 -]  │
+    │  Output:          [/path/to/out.tif]  [Browse]│
     │                                              │
     │             [Cancel]   [Export]              │
     └──────────────────────────────────────────────┘
+
+V1.3 changes vs V1.2: replaced the matplotlib `MplCanvas` preview *and*
+the row of per-tile checkboxes with a single :class:`TileLayoutWidget`
+in ``"select"`` mode. Click any tile in the canvas to toggle inclusion;
+selection state is read on Export. Same backend job, simpler UI.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+import os
+from typing import Dict, List, Optional, Set, Tuple
 
-import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from nd2studios.backend.exporters.stitch_exporter import (
-    StitchLayout, compute_tile_layout,
+    compute_tile_layout,
 )
 from nd2studios.backend.nd2_volume import LazyND2Volume
 from nd2studios.core.settings import Settings
-from nd2studios.widgets.common import MplCanvas
 from nd2studios.widgets.image_viewer import CHANNEL_COLORS
+from nd2studios.widgets.tile_layout import TileLayoutWidget
 from nd2studios.workers.stitch_worker import StitchRequest, StitchWorker
 
 
@@ -57,67 +63,64 @@ class StitchDialog(QDialog):
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Stitch M positions")
-        self.setMinimumSize(620, 620)
+        self.setMinimumSize(680, 720)
 
         self.volume = volume
-        self.stage_xy_um = stage_xy_um
+        self.stage_xy_um = list(stage_xy_um or [])
         self.main_window = main_window
         self._channel_display = channel_display or {}
-        self._tile_checkboxes: List[QCheckBox] = []
         self._channel_checkboxes: List[QCheckBox] = []
         self._channel_colors: List[QComboBox] = []
         self._worker: Optional[StitchWorker] = None
         self._output_path: str = ""
 
+        # Default selection: every tile is in.
+        self._selected: Set[int] = set(range(volume.n_multipoints))
+
         self._build_ui()
-        self._refresh_layout_preview()
+        self._refresh_summary()
 
     # ── UI ──
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        # Layout preview.
-        preview_group = QGroupBox("Layout preview")
-        preview_layout = QVBoxLayout(preview_group)
-        self.canvas = MplCanvas(self, width=5, height=3.4, dpi=90)
-        self.ax = self.canvas.add_subplot(111)
-        preview_layout.addWidget(self.canvas)
-        self.lbl_layout_source = QLabel("")
-        self.lbl_layout_source.setStyleSheet(
-            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
-        preview_layout.addWidget(self.lbl_layout_source)
-        layout.addWidget(preview_group)
+        # Interactive layout in select mode.
+        layout_group = QGroupBox("Tile selection")
+        lg_layout = QVBoxLayout(layout_group)
+        self.tile_widget = TileLayoutWidget(
+            mode="select",
+            show_expand_button=True,
+            minimum_size=(620, 280),
+        )
+        self.tile_widget.set_tile_layout(
+            stage_xy_um=self.stage_xy_um,
+            pixel_size_um=self.volume.pixel_size_um,
+            tile_h=self.volume.height,
+            tile_w=self.volume.width,
+            m_indices=list(range(self.volume.n_multipoints)),
+            current_m=0,
+            selected_indices=self._selected,
+        )
+        self.tile_widget.selection_changed.connect(self._on_selection_changed)
+        self.tile_widget.expand_requested.connect(self._open_expanded_dialog)
+        lg_layout.addWidget(self.tile_widget, stretch=1)
 
-        # Tile selection.
-        tile_group = QGroupBox(f"Tile selection ({self.volume.n_multipoints} positions)")
-        tile_outer = QVBoxLayout(tile_group)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(120)
-        host = QWidget()
-        grid = QHBoxLayout(host)
-        grid.setContentsMargins(2, 2, 2, 2)
-        grid.setSpacing(4)
-        for m in range(self.volume.n_multipoints):
-            cb = QCheckBox(f"M{m}")
-            cb.setChecked(True)
-            cb.stateChanged.connect(lambda *_: self._refresh_layout_preview())
-            grid.addWidget(cb)
-            self._tile_checkboxes.append(cb)
-        grid.addStretch(1)
-        scroll.setWidget(host)
-        tile_outer.addWidget(scroll)
-        bulk = QHBoxLayout()
+        # Bulk + summary row.
+        bulk_row = QHBoxLayout()
         btn_all = QPushButton("Select all")
         btn_all.clicked.connect(lambda: self._set_all_tiles(True))
-        bulk.addWidget(btn_all)
+        bulk_row.addWidget(btn_all)
         btn_none = QPushButton("Select none")
         btn_none.clicked.connect(lambda: self._set_all_tiles(False))
-        bulk.addWidget(btn_none)
-        bulk.addStretch(1)
-        tile_outer.addLayout(bulk)
-        layout.addWidget(tile_group)
+        bulk_row.addWidget(btn_none)
+        bulk_row.addStretch(1)
+        self.lbl_summary = QLabel("")
+        self.lbl_summary.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        bulk_row.addWidget(self.lbl_summary)
+        lg_layout.addLayout(bulk_row)
+        layout.addWidget(layout_group)
 
         # Channels.
         ch_group = QGroupBox("Channels")
@@ -143,18 +146,25 @@ class StitchDialog(QDialog):
             ch_outer.addLayout(row)
         layout.addWidget(ch_group)
 
-        # Z mode + Z slice.
+        # Z mode. 'none' preserves every Z plane in the stitched
+        # hyperstack; max/mean/min collapse Z to 1.
         z_group = QGroupBox("Z handling")
-        z_form = QFormLayout(z_group)
+        z_outer = QVBoxLayout(z_group)
+        z_form = QFormLayout()
         self.combo_z = QComboBox()
         self.combo_z.addItems(["max", "mean", "min", "none"])
         z_form.addRow("Z mode", self.combo_z)
-        self.spin_z = QSpinBox()
-        self.spin_z.setRange(0, max(0, self.volume.n_zslices - 1))
-        z_form.addRow("Z slice (when 'none')", self.spin_z)
+        z_outer.addLayout(z_form)
+        self.lbl_z_hint = QLabel("")
+        self.lbl_z_hint.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        self.lbl_z_hint.setWordWrap(True)
+        z_outer.addWidget(self.lbl_z_hint)
         layout.addWidget(z_group)
+        self.combo_z.currentTextChanged.connect(self._on_z_mode_changed)
+        self._on_z_mode_changed(self.combo_z.currentText())
 
-        # Output.
+        # Output path.
         out_group = QGroupBox("Output")
         out_form = QHBoxLayout(out_group)
         self.lbl_out = QLabel("(no path chosen)")
@@ -177,17 +187,86 @@ class StitchDialog(QDialog):
         bb.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._on_export)
         layout.addWidget(bb)
 
-    # ── Helpers ──
+    # ── Selection handling ──
+    def _on_selection_changed(self, indices: Set[int]) -> None:
+        self._selected = set(indices)
+        self._refresh_summary()
+
     def _set_all_tiles(self, value: bool) -> None:
-        for cb in self._tile_checkboxes:
-            cb.blockSignals(True)
-            cb.setChecked(value)
-            cb.blockSignals(False)
-        self._refresh_layout_preview()
+        n = self.volume.n_multipoints
+        new_set = set(range(n)) if value else set()
+        self.tile_widget.set_selected_indices(new_set)
+        # Widget emits the change; just update local state and summary.
+        self._selected = new_set
+        self._refresh_summary()
 
-    def _selected_m_indices(self) -> List[int]:
-        return [i for i, cb in enumerate(self._tile_checkboxes) if cb.isChecked()]
+    def _open_expanded_dialog(self) -> None:
+        """Pop a much larger view of the layout for huge tile sets."""
+        from nd2studios.widgets.tile_layout import TileLayoutDialog
+        dlg = TileLayoutDialog(
+            mode="select",
+            stage_xy_um=self.stage_xy_um,
+            pixel_size_um=self.volume.pixel_size_um,
+            tile_h=self.volume.height, tile_w=self.volume.width,
+            m_indices=list(range(self.volume.n_multipoints)),
+            current_m=0,
+            selected_indices=self._selected,
+            parent=self,
+        )
+        # Keep the small widget mirrored as the user picks tiles in the modal.
+        dlg.selection_changed.connect(self._sync_from_dialog)
+        dlg.exec()
 
+    def _sync_from_dialog(self, indices: Set[int]) -> None:
+        self._selected = set(indices)
+        self.tile_widget.set_selected_indices(self._selected)
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        n_total = self.volume.n_multipoints
+        n_sel = len(self._selected)
+        layout = compute_tile_layout(
+            stage_xy_um=self.stage_xy_um,
+            pixel_size_um=self.volume.pixel_size_um,
+            tile_h=self.volume.height, tile_w=self.volume.width,
+            m_indices=sorted(self._selected),
+        ) if self._selected else None
+        if layout is not None:
+            n_ch = sum(
+                1 for cb in self._channel_checkboxes if cb.isChecked()
+            ) or 1
+            n_z_out = (self.volume.n_zslices
+                       if self.combo_z.currentText() == "none"
+                          and self.volume.n_zslices > 1
+                       else 1)
+            mb = (layout.canvas_h * layout.canvas_w
+                  * n_ch * self.volume.dtype.itemsize
+                  * self.volume.n_timepoints * n_z_out) / 1_048_576
+            z_note = f" · {n_z_out} Z" if n_z_out > 1 else ""
+            self.lbl_summary.setText(
+                f"{n_sel} / {n_total} tiles · "
+                f"{layout.canvas_w}×{layout.canvas_h} px{z_note} · "
+                f"~{mb:.0f} MB"
+            )
+        else:
+            self.lbl_summary.setText(f"0 / {n_total} tiles selected")
+
+    def _on_z_mode_changed(self, mode: str) -> None:
+        if self.volume.n_zslices <= 1:
+            self.lbl_z_hint.setText("Single-Z file — Z mode has no effect.")
+        elif mode == "none":
+            self.lbl_z_hint.setText(
+                f"All {self.volume.n_zslices} Z planes preserved "
+                "(TZCYX hyperstack)."
+            )
+        else:
+            self.lbl_z_hint.setText(
+                f"{self.volume.n_zslices} Z planes collapsed via "
+                f"{mode}-projection."
+            )
+        self._refresh_summary()
+
+    # ── Channels ──
     def _selected_channels(self) -> List[int]:
         return [i for i, cb in enumerate(self._channel_checkboxes) if cb.isChecked()]
 
@@ -197,6 +276,7 @@ class StitchDialog(QDialog):
             out[i] = CHANNEL_COLORS.get(combo.currentText(), (255, 255, 255))
         return out
 
+    # ── Output / Export ──
     def _browse(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self, "Stitched output", "",
@@ -208,49 +288,11 @@ class StitchDialog(QDialog):
             self._output_path = path
             self.lbl_out.setText(path)
 
-    def _refresh_layout_preview(self) -> None:
-        m_indices = self._selected_m_indices()
-        layout = compute_tile_layout(
-            stage_xy_um=self.stage_xy_um,
-            pixel_size_um=self.volume.pixel_size_um,
-            tile_h=self.volume.height,
-            tile_w=self.volume.width,
-            m_indices=m_indices,
-        )
-        self._draw_preview(layout, m_indices)
-        self.lbl_layout_source.setText(
-            f"Source: {layout.source}   Canvas: "
-            f"{layout.canvas_w} × {layout.canvas_h} px"
-        )
-
-    def _draw_preview(self, layout: StitchLayout, m_indices: List[int]) -> None:
-        ax = self.ax
-        ax.clear()
-        ax.set_facecolor(Settings.BG_SECONDARY)
-        ax.set_aspect("equal")
-        ax.invert_yaxis()
-        # Draw tile rectangles.
-        for offset, m in zip(layout.offsets, m_indices):
-            y, x = offset
-            rect_x = [x, x + layout.tile_w, x + layout.tile_w, x, x]
-            rect_y = [y, y, y + layout.tile_h, y + layout.tile_h, y]
-            ax.plot(rect_x, rect_y, color=Settings.ACCENT_PURPLE, linewidth=1)
-            ax.text(x + layout.tile_w / 2, y + layout.tile_h / 2, f"{m}",
-                    color=Settings.FG_PRIMARY, fontsize=8,
-                    ha="center", va="center")
-        ax.set_xlim(-layout.tile_w * 0.1, layout.canvas_w + layout.tile_w * 0.1)
-        ax.set_ylim(layout.canvas_h + layout.tile_h * 0.1, -layout.tile_h * 0.1)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for s in ax.spines.values():
-            s.set_color(Settings.BORDER_COLOR)
-        self.canvas.draw_idle()
-
-    # ── Export ──
     def _on_export(self) -> None:
-        m_indices = self._selected_m_indices()
+        m_indices = sorted(self._selected)
         if not m_indices:
-            QMessageBox.information(self, "Pick tiles", "Select at least one M position.")
+            QMessageBox.information(self, "Pick tiles",
+                                    "Click at least one tile to include it.")
             return
         channel_indices = self._selected_channels()
         if not channel_indices:
@@ -264,8 +306,7 @@ class StitchDialog(QDialog):
         layout = compute_tile_layout(
             stage_xy_um=self.stage_xy_um,
             pixel_size_um=self.volume.pixel_size_um,
-            tile_h=self.volume.height,
-            tile_w=self.volume.width,
+            tile_h=self.volume.height, tile_w=self.volume.width,
             m_indices=m_indices,
         )
         request = StitchRequest(
@@ -276,8 +317,8 @@ class StitchDialog(QDialog):
             channel_colors=self._channel_color_map(),
             filepath=self._output_path,
             z_mode=self.combo_z.currentText(),
-            z_index=int(self.spin_z.value()),
-            rgb=len(channel_indices) > 1,
+            z_index=0,
+            rgb=False,
             pixel_size_um=self.volume.pixel_size_um,
         )
         self._worker = StitchWorker(request)
@@ -302,9 +343,17 @@ class StitchDialog(QDialog):
             self.main_window.set_progress(0)
             self.main_window.set_status_text(f"Stitched: {result}")
         QMessageBox.information(self, "Stitch complete", f"Wrote:\n{result}")
+        # Wait for the worker's OS thread to finish before the dialog
+        # closes — otherwise Python may GC the QThread wrapper while
+        # the underlying thread is still in its tail-end shutdown,
+        # producing "QThread: Destroyed while thread is still running".
+        if self._worker is not None:
+            self._worker.wait(5000)
         self.accept()
 
     def _on_error(self, msg: str) -> None:
         QMessageBox.warning(self, "Stitch failed", msg)
         if self.main_window is not None:
             self.main_window.set_progress(0)
+        if self._worker is not None:
+            self._worker.wait(5000)

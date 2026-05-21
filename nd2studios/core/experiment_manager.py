@@ -74,12 +74,41 @@ class ND2StudiosRecord:
     # Raw channels right after import (post Z-projection). Each value is
     # either a numpy array or a `LazyND2Channel` proxy.
     _raw_channels: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    # Pre-crop snapshot of _raw_channels. Set by RecipePage._apply_crop() the
+    # first time a crop is applied; cleared by _reset_crop(). Lives on the
+    # record (not the page) so it survives tab navigation for all file types.
+    _original_raw_channels: Optional[Dict[str, Any]] = field(default=None, repr=False)
     # Channels after the recipe has been applied. None if no recipe yet.
     _processed_channels: Optional[Dict[str, np.ndarray]] = field(default=None, repr=False)
     # Per-frame timestamps (seconds since experiment start), if present in ND2.
     _frame_timestamps: Optional[np.ndarray] = field(default=None, repr=False)
     # V1.1: a LazyND2Volume for M/Z scrolling (rebuilt from filepath on load).
     _raw_volume: Optional[Any] = field(default=None, repr=False)
+    # Crop applied in RecipePage: (x, y, w, h) in image pixels.
+    # In-session only — not serialized to the .nd2s file.
+    crop_rect: Optional[Tuple[int, int, int, int]] = field(default=None, repr=False)
+
+    # Analysis page — not serialized (results are re-run or exported explicitly).
+    analysis_config: Dict[str, Any] = field(default_factory=dict, repr=False)
+    analysis_results: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    # Results page config (serialized: column/export prefs).
+    results_config: Dict[str, Any] = field(default_factory=dict)
+    # Batch page config (serialized: last template path, output dir, etc.).
+    batch_config: Dict[str, Any] = field(default_factory=dict)
+
+    # Analysis page — Manual Mask drawing state (serialized).
+    # Schema (V1.31+):
+    #   {m_position: {frame_idx: {z_key: [{"type": str,
+    #                                       "vertices": [[y, x], ...]}, ...]}}}
+    # where ``z_key`` is either an integer Z slice index or the string "all"
+    # meaning the shape applies uniformly to every Z slice (the default for
+    # files viewed in Z projection mode).  Vertices are floats in image-pixel
+    # space.  V1.30 sessions stored a bare list at the frame level — those are
+    # automatically migrated to ``{"all": [shapes]}`` on load.
+    manual_mask_shapes: Dict[int, Dict[int, Dict[Any, List[Dict[str, Any]]]]] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> dict:
         """Serialize the JSON-safe portion of the record."""
@@ -107,6 +136,20 @@ class ND2StudiosRecord:
             "n_zslices": self.n_zslices,
             "pixel_size_um": self.pixel_size_um,
             "fps": self.fps,
+            "results_config": self.results_config,
+            "batch_config": self.batch_config,
+            # JSON keys are always strings — convert int keys back on load.
+            # Inner z_key keeps "all" as-is; integer Z indices are stringified.
+            "manual_mask_shapes": {
+                str(m): {
+                    str(t): {
+                        (z_key if z_key == "all" else str(int(z_key))): shapes
+                        for z_key, shapes in by_z.items()
+                    }
+                    for t, by_z in per_t.items()
+                }
+                for m, per_t in self.manual_mask_shapes.items()
+            },
         }
 
     @classmethod
@@ -115,6 +158,8 @@ class ND2StudiosRecord:
         for key, val in d.items():
             if key == "recipe":
                 rec.recipe = [(item["name"], dict(item.get("params", {}))) for item in val]
+            elif key == "manual_mask_shapes" and isinstance(val, dict):
+                rec.manual_mask_shapes = _load_manual_mask_shapes(val)
             elif hasattr(rec, key) and not key.startswith("_"):
                 setattr(rec, key, val)
         return rec
@@ -232,3 +277,52 @@ def _materialize(channel_data: Any) -> np.ndarray:
     if callable(materialize):
         return materialize()
     return np.asarray(channel_data)
+
+
+def _load_manual_mask_shapes(
+    raw: Dict[str, Any],
+) -> Dict[int, Dict[int, Dict[Any, List[Dict[str, Any]]]]]:
+    """Deserialize ``manual_mask_shapes`` with legacy-format migration.
+
+    V1.30 stored each frame as a bare list of shapes — that gets wrapped as
+    ``{"all": [shapes]}``.  V1.31+ already nests by z_key.  Outer m and t
+    keys are coerced back to int; inner z_keys keep "all" as-is and parse
+    numeric strings as int.
+    """
+    out: Dict[int, Dict[int, Dict[Any, List[Dict[str, Any]]]]] = {}
+    for m_key, per_t in raw.items():
+        if not isinstance(per_t, dict):
+            continue
+        try:
+            m = int(m_key)
+        except (TypeError, ValueError):
+            continue
+        per_t_out: Dict[int, Dict[Any, List[Dict[str, Any]]]] = {}
+        for t_key, frame_val in per_t.items():
+            try:
+                t = int(t_key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(frame_val, list):
+                # Legacy V1.30 — promote to {"all": [shapes]}.
+                if frame_val:
+                    per_t_out[t] = {"all": list(frame_val)}
+                continue
+            if not isinstance(frame_val, dict):
+                continue
+            by_z: Dict[Any, List[Dict[str, Any]]] = {}
+            for z_key, shapes in frame_val.items():
+                if not shapes:
+                    continue
+                if z_key == "all" or z_key == "ALL":
+                    by_z["all"] = list(shapes)
+                else:
+                    try:
+                        by_z[int(z_key)] = list(shapes)
+                    except (TypeError, ValueError):
+                        continue
+            if by_z:
+                per_t_out[t] = by_z
+        if per_t_out:
+            out[m] = per_t_out
+    return out

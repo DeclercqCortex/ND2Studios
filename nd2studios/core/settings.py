@@ -56,6 +56,9 @@ class Settings:
         ("import", "📂", "Import", "Load an ND2 or TIFF file and inspect metadata."),
         ("recipe", "🧪", "Recipe", "Build a processing pipeline (trial / accept / reject)."),
         ("export", "💾", "Export", "Export TIFF stacks, RGB composites, and movies."),
+        ("analysis", "🔬", "Analysis", "Run analysis pipelines on loaded data."),
+        ("results", "📊", "Results", "Compute measurements from analysis binaries and export CSV / images."),
+        ("batch", "⚡", "Batch", "Run a pipeline template over multiple files and aggregate results."),
     ]
 
     # Status ladder. Forward navigation can require a minimum status.
@@ -66,4 +69,7 @@ class Settings:
         "import": None,
         "recipe": ("imported", "Import a file first (Page 1)."),
         "export": ("imported", "Import a file first (Page 1)."),
+        "analysis": ("imported", "Import a file first (Page 1)."),
+        "results": ("imported", "Import a file first (Page 1)."),
+        "batch": None,
     }

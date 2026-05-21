@@ -40,10 +40,14 @@ def main() -> None:
     from nd2studios.core.theme import STYLESHEET
     from nd2studios.core.main_window import MainWindow
 
-    # Force-import the enhancement plugin module so its decorator-based
-    # registration runs at startup (otherwise the Recipe page sees an
-    # empty registry).
+    # Force-import plugin/pipeline modules so decorator-based registration
+    # runs at startup before any page is constructed.
     import nd2studios.plugins.enhancement.builtin  # noqa: F401
+    import nd2studios.backend.analysis.nuclei_segmentation  # noqa: F401
+    import nd2studios.backend.analysis.tear_detection  # noqa: F401
+    import nd2studios.backend.analysis.histogram_threshold_pipeline  # noqa: F401
+    import nd2studios.backend.analysis.spots_pipeline  # noqa: F401
+    import nd2studios.backend.analysis.manual_mask  # noqa: F401
 
     app = QApplication(sys.argv)
     app.setApplicationName(Settings.APP_NAME)

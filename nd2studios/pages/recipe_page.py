@@ -20,11 +20,12 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSplitter,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from nd2studios.core.experiment_manager import ND2StudiosRecord
@@ -53,6 +54,8 @@ class RecipePage(QWidget):
         # Trial state.
         self._trial_step: Optional[Tuple[str, Dict[str, Any]]] = None
         self._worker: Optional[RecipeWorker] = None
+        # Crop state — in-session only, not persisted.
+        self._crop_rect: Optional[Tuple[int, int, int, int]] = None  # x, y, w, h
 
         self._build_ui()
         self._populate_plugin_list()
@@ -102,6 +105,26 @@ class RecipePage(QWidget):
         self.btn_reject.clicked.connect(self._on_reject)
         trial_row.addWidget(self.btn_reject)
         ll.addLayout(trial_row)
+
+        # Crop group
+        crop_group = QGroupBox("Crop")
+        cl = QVBoxLayout(crop_group)
+        self.btn_crop_mode = QPushButton("Crop Mode")
+        self.btn_crop_mode.setCheckable(True)
+        self.btn_crop_mode.setToolTip(
+            "Enable crop tool on the Raw viewer.\n"
+            "Click anywhere to enter the corner and size manually.\n"
+            "Click-drag to draw the crop rectangle — values are pre-filled."
+        )
+        cl.addWidget(self.btn_crop_mode)
+        self.lbl_crop_status = QLabel("No crop applied")
+        self.lbl_crop_status.setStyleSheet(
+            f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        cl.addWidget(self.lbl_crop_status)
+        self.btn_reset_crop = QPushButton("Reset Crop")
+        self.btn_reset_crop.setEnabled(False)
+        cl.addWidget(self.btn_reset_crop)
+        ll.addWidget(crop_group)
 
         # Recipe list
         rec_group = QGroupBox("Recipe")
@@ -154,6 +177,173 @@ class RecipePage(QWidget):
         right.setStretchFactor(1, 1)
         outer.addWidget(right, stretch=1)
 
+        # Crop signal wiring (viewers exist now)
+        self.btn_crop_mode.toggled.connect(self._on_crop_mode_toggled)
+        self.btn_reset_crop.clicked.connect(self._reset_crop)
+        self.viewer_raw.canvas.clicked.connect(self._on_canvas_click)
+        self.viewer_raw.crop_rect_selected.connect(self._on_crop_drag)
+
+    # ── Crop ──
+    def _on_crop_mode_toggled(self, enabled: bool) -> None:
+        self.viewer_raw.set_crop_mode(enabled)
+        if enabled:
+            self.viewer_raw.zoom_toolbar.btn_pan.setChecked(False)
+
+    def _on_canvas_click(self, iy: float, ix: float) -> None:
+        if not self.btn_crop_mode.isChecked():
+            return
+        result = self._show_crop_dialog(x=int(ix), y=int(iy), w=0, h=0)
+        if result is not None:
+            self._apply_crop(*result)
+
+    def _on_crop_drag(self, x: int, y: int, w: int, h: int) -> None:
+        result = self._show_crop_dialog(x=x, y=y, w=w, h=h)
+        if result is not None:
+            self._apply_crop(*result)
+
+    def _show_crop_dialog(
+        self, x: int, y: int, w: int, h: int
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Open a dialog for the user to confirm/edit the crop rectangle.
+
+        Returns (x, y, w, h) or None if cancelled.
+        """
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            return None
+        exp = self.main_window.exp_manager.active
+        source = exp._original_raw_channels or exp._raw_channels
+        if not source:
+            return None
+
+        # Determine current image dimensions from the *original* (pre-crop) source.
+        sample = next(iter(source.values()))
+        if hasattr(sample, "shape"):
+            arr_shape = sample.shape
+        else:
+            arr_shape = np.asarray(sample).shape
+        img_h = int(arr_shape[-2])
+        img_w = int(arr_shape[-1])
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Crop Image")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(f"Image: {img_w} × {img_h} px  "
+                      f"(X = columns from left, Y = rows from top)")
+        info.setStyleSheet(f"color: {Settings.FG_SECONDARY}; font: 9pt;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        sp_x = QSpinBox()
+        sp_x.setRange(0, img_w - 1)
+        sp_x.setValue(max(0, min(x, img_w - 1)))
+        sp_x.setToolTip("Left edge of crop (pixels from image left)")
+
+        sp_y = QSpinBox()
+        sp_y.setRange(0, img_h - 1)
+        sp_y.setValue(max(0, min(y, img_h - 1)))
+        sp_y.setToolTip("Top edge of crop (pixels from image top)")
+
+        sp_w = QSpinBox()
+        sp_w.setRange(1, img_w)
+        sp_w.setValue(w if w > 0 else max(1, img_w - x))
+        sp_w.setToolTip("Width of crop in pixels")
+
+        sp_h = QSpinBox()
+        sp_h.setRange(1, img_h)
+        sp_h.setValue(h if h > 0 else max(1, img_h - y))
+        sp_h.setToolTip("Height of crop in pixels")
+
+        form.addRow("X (left corner):", sp_x)
+        form.addRow("Y (top corner):", sp_y)
+        form.addRow("Width (px):", sp_w)
+        form.addRow("Height (px):", sp_h)
+        layout.addLayout(form)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        cx, cy, cw, ch = sp_x.value(), sp_y.value(), sp_w.value(), sp_h.value()
+        if cx + cw > img_w or cy + ch > img_h:
+            QMessageBox.warning(
+                self, "Invalid crop",
+                f"Crop region ({cx}+{cw}={cx+cw}, {cy}+{ch}={cy+ch}) "
+                f"exceeds image bounds ({img_w}, {img_h}).\n"
+                "Clamping to image boundary."
+            )
+            cw = min(cw, img_w - cx)
+            ch = min(ch, img_h - cy)
+        return (cx, cy, cw, ch)
+
+    def _apply_crop(self, x: int, y: int, w: int, h: int) -> None:
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            return
+        exp = self.main_window.exp_manager.active
+        if not exp._raw_channels:
+            return
+
+        # Always crop from original so the user can re-crop without nesting.
+        if exp._original_raw_channels is None:
+            exp._original_raw_channels = dict(exp._raw_channels)
+        source = exp._original_raw_channels
+
+        cropped: Dict[str, Any] = {}
+        for ch_name, ch_data in source.items():
+            crop_fn = getattr(ch_data, "crop", None)
+            if callable(crop_fn):
+                cropped[ch_name] = crop_fn(y, y + h, x, x + w)
+            else:
+                arr = np.asarray(ch_data)
+                cropped[ch_name] = arr[:, y:y + h, x:x + w]
+
+        self._crop_rect = (x, y, w, h)
+        exp.crop_rect = (x, y, w, h)
+        exp._raw_channels = cropped
+        exp._processed_channels = None
+
+        self.btn_crop_mode.setChecked(False)
+        self.btn_reset_crop.setEnabled(True)
+        self.lbl_crop_status.setText(f"Crop: x={x}, y={y}, {w}×{h} px")
+
+        # After crop, always show the flat cropped channels (no Z volume path).
+        self.viewer_raw.set_channels(cropped, channel_display=exp.channel_display)
+        if self._recipe:
+            self._run_recipe(exp, list(self._recipe),
+                             label="Re-running recipe on cropped data…",
+                             on_done=self._on_revert_done)
+        else:
+            self.viewer_proc.set_channels(cropped, channel_display=exp.channel_display)
+
+    def _reset_crop(self) -> None:
+        if self.main_window is None or self.main_window.exp_manager.active is None:
+            return
+        exp = self.main_window.exp_manager.active
+        if exp._original_raw_channels is None:
+            return
+
+        exp._raw_channels = exp._original_raw_channels
+        exp._original_raw_channels = None
+        exp._processed_channels = None
+        exp.crop_rect = None
+        self._crop_rect = None
+        self.btn_reset_crop.setEnabled(False)
+        self.lbl_crop_status.setText("No crop applied")
+
+        self._refresh_raw_viewer(exp)
+        if self._recipe:
+            self._run_recipe(exp, list(self._recipe),
+                             label="Re-running recipe after crop reset…",
+                             on_done=self._on_revert_done)
+        else:
+            self.viewer_proc.set_channels(exp._raw_channels, channel_display=exp.channel_display)
+
     def _populate_plugin_list(self) -> None:
         # Force-import to ensure registration.
         import nd2studios.plugins.enhancement.builtin  # noqa: F401
@@ -169,14 +359,47 @@ class RecipePage(QWidget):
         if self.main_window is None or self.main_window.exp_manager.active is None:
             return
         exp = self.main_window.exp_manager.active
+        # Restore crop UI from the experiment record (survives tab navigation).
+        # exp._original_raw_channels persists on the record for all file types,
+        # so no reconstruction from _raw_volume is needed.
+        self.btn_crop_mode.setChecked(False)
+        if exp.crop_rect is not None:
+            x, y, w, h = exp.crop_rect
+            self._crop_rect = exp.crop_rect
+            self.btn_reset_crop.setEnabled(True)
+            self.lbl_crop_status.setText(f"Crop: x={x}, y={y}, {w}×{h} px")
+        else:
+            self._crop_rect = None
+            self.btn_reset_crop.setEnabled(False)
+            self.lbl_crop_status.setText("No crop applied")
         # Refresh the raw preview from the active experiment.
         if exp._raw_channels:
-            self.viewer_raw.set_channels(exp._raw_channels,
-                                         channel_display=exp.channel_display)
+            self._refresh_raw_viewer(exp)
             # If a processed cache already exists, mirror it on the right.
             if exp._processed_channels:
                 self.viewer_proc.set_channels(exp._processed_channels,
                                               channel_display=exp.channel_display)
+
+    def _refresh_raw_viewer(self, exp: ND2StudiosRecord) -> None:
+        """Wire the raw viewer to the volume (Z-scrollable) or flat channels.
+
+        Volume path: z_mode="none", multi-Z volume, no crop active.
+        Flat path: everything else (projection, TIFF source, or crop active).
+        """
+        if (exp.crop_rect is None
+                and exp._raw_volume is not None
+                and exp.n_zslices > 1
+                and exp.z_view_mode == "none"):
+            self.viewer_raw.set_volume(
+                exp._raw_volume,
+                channel_display=exp.channel_display,
+                z_mode="none",
+                z_index=exp.z_view_index,
+                m=exp.m_index, t=0, z=exp.z_view_index,
+            )
+        else:
+            self.viewer_raw.set_channels(exp._raw_channels,
+                                         channel_display=exp.channel_display)
 
     def load_from_experiment(self, exp: ND2StudiosRecord) -> None:
         self._recipe = list(exp.recipe)

@@ -194,9 +194,10 @@ class LazyND2Channel:
     def __init__(self, filepath: str, channel_index: int,
                  t_start: int, t_end: int, z_start: int, z_end: int,
                  z_projection: str, height: int, width: int, dtype,
-                 t_stride: int = 1):
+                 t_stride: int = 1, m_index: int = 0):
         self._filepath = filepath
         self._ch = channel_index
+        self._m = int(m_index)
         self._t0 = t_start
         self._t1 = t_end
         self._t_stride = max(1, int(t_stride))
@@ -248,11 +249,12 @@ class LazyND2Channel:
         def _idx(z_val):
             out = []
             for d in self._dim_order:
-                if d == "T":      out.append(t_abs)
-                elif d == "C":    out.append(self._ch)
-                elif d == "Z":    out.append(z_val)
+                if d == "T":          out.append(t_abs)
+                elif d == "C":        out.append(self._ch)
+                elif d == "Z":        out.append(z_val)
+                elif d in ("P", "M"): out.append(self._m)
                 elif d in ("Y", "X"): out.append(slice(None))
-                else:             out.append(0)
+                else:                 out.append(0)
             return tuple(out)
 
         if Z_total > 1 and self._zproj != "none":
@@ -516,39 +518,110 @@ def read_nd2_metadata_extended(filepath):
         out["camera_name"] = str(_safe(lambda: camera.cameraName) or "")
         out["microscope_name"] = str(_safe(lambda: microscope.systemName) or "") if microscope else ""
 
-        frame_ts = []
-        stage_xy = []
-        stage_z = []
-        try:
-            n = out["n_timepoints"]
-            for t in range(n):
-                fm = _safe(lambda i=t: f.frame_metadata(i))
+        seq_dims = [d for d in out["dim_order"] if d not in ("Y", "X")]
+        m_axis = "P" if "P" in seq_dims else ("M" if "M" in seq_dims else None)
+        n_m = sizes.get(m_axis, 1) if m_axis else 1
+        n_t = out["n_timepoints"]
+
+        def _flat(coords: Dict[str, int]) -> int:
+            idx = 0
+            for d in seq_dims:
+                idx = idx * sizes.get(d, 1) + int(coords.get(d, 0))
+            return idx
+
+        def _read_xy_from_experiment() -> List[Tuple[float, float]]:
+            """Read planned stage XY positions from f.experiment (XYPosLoop)."""
+            pts: List[Tuple[float, float]] = []
+            for loop in (_safe(lambda: f.experiment, default=[]) or []):
+                ltype = str(_safe(lambda lp=loop: lp.type) or "")
+                if "XYPos" not in ltype:
+                    continue
+                points = (
+                    _safe(lambda lp=loop: list(lp.parameters.points), default=[]) or []
+                )
+                for pt in points:
+                    sx = _safe(lambda p=pt: float(p.stagePositionUm.x))
+                    sy = _safe(lambda p=pt: float(p.stagePositionUm.y))
+                    if sx is not None and sy is not None:
+                        pts.append((sx, sy))
+                if pts:
+                    return pts
+            return []
+
+        # 1) Per-M stage positions — try f.experiment XYPosLoop first, then
+        #    fall back to frame_metadata() per-M (which requires correct flat-
+        #    index arithmetic). The experiment loop is the authoritative planned
+        #    positions; frame_metadata is the actual per-frame readback.
+        stage_xy: List[Tuple[float, float]] = []
+        stage_z: List[float] = []
+
+        stage_xy = _read_xy_from_experiment()
+        xy_source_method = "experiment" if stage_xy else "frame_metadata"
+
+        if not stage_xy and m_axis is not None:
+            for m in range(n_m):
+                coords = {m_axis: m, "T": 0, "Z": 0, "C": 0}
+                seq_idx = _flat(coords)
+                fm = _safe(lambda i=seq_idx: f.frame_metadata(i))
                 if fm is None:
                     continue
-                ts = (
-                    _safe(lambda m=fm: float(m.channels[0].time.relativeTimeMs)) or
-                    _safe(lambda m=fm: float(m.relativeTimeMs))
-                )
-                if ts is not None:
-                    frame_ts.append(ts / 1000.0)
                 pos = (
-                    _safe(lambda m=fm: m.channels[0].position) or
-                    _safe(lambda m=fm: m.position)
+                    _safe(lambda meta=fm: meta.channels[0].position) or
+                    _safe(lambda meta=fm: meta.position)
+                )
+                if pos is None:
+                    continue
+                sx = _safe(lambda p=pos: float(p.stagePositionUm.x))
+                sy = _safe(lambda p=pos: float(p.stagePositionUm.y))
+                sz = _safe(lambda p=pos: float(p.stagePositionUm.z))
+                if sx is not None and sy is not None:
+                    stage_xy.append((sx, sy))
+                if sz is not None:
+                    stage_z.append(sz)
+        elif not stage_xy:
+            # Single-M file — record one nominal position from frame 0.
+            fm0 = _safe(lambda: f.frame_metadata(0))
+            if fm0 is not None:
+                pos = (
+                    _safe(lambda meta=fm0: meta.channels[0].position) or
+                    _safe(lambda meta=fm0: meta.position)
                 )
                 if pos is not None:
                     sx = _safe(lambda p=pos: float(p.stagePositionUm.x))
                     sy = _safe(lambda p=pos: float(p.stagePositionUm.y))
-                    sz = _safe(lambda p=pos: float(p.stagePositionUm.z))
                     if sx is not None and sy is not None:
                         stage_xy.append((sx, sy))
-                    if sz is not None:
-                        stage_z.append(sz)
-        except Exception:
-            pass
+
+        n_xy_from_stage = len(stage_xy)
+
+        # 2) Per-T frame timestamps.
+        frame_ts: List[float] = []
+        for t in range(n_t):
+            coords = {"T": t, "Z": 0, "C": 0}
+            if m_axis is not None:
+                coords[m_axis] = 0
+            seq_idx = _flat(coords)
+            fm = _safe(lambda i=seq_idx: f.frame_metadata(i))
+            if fm is None:
+                continue
+            ts = (
+                _safe(lambda meta=fm: float(meta.channels[0].time.relativeTimeMs)) or
+                _safe(lambda meta=fm: float(meta.relativeTimeMs))
+            )
+            if ts is not None:
+                frame_ts.append(ts / 1000.0)
+
+        if n_xy_from_stage == n_m and n_m > 0:
+            stage_layout_source = f"stage_xy:{xy_source_method}"
+        elif n_xy_from_stage > 0:
+            stage_layout_source = f"partial:{n_xy_from_stage}/{n_m}:{xy_source_method}"
+        else:
+            stage_layout_source = "missing"
 
         out["frame_timestamps_s"] = frame_ts
         out["stage_xy_um"] = stage_xy
         out["stage_z_um"] = stage_z
+        out["stage_layout_source"] = stage_layout_source
         out["acquisition_start"] = ""
         out["loops"] = [
             {
@@ -560,5 +633,142 @@ def read_nd2_metadata_extended(filepath):
 
     return out
 
-# Also need Any type for some downstream type hints; since we removed
-# them above, no extra import is needed.
+
+def read_nd2_metadata_extended_multi(
+    filepaths: List[str],
+    chain_axis: str = "Z",
+    chain_mapping: Optional[List[Tuple[int, int]]] = None,
+) -> Dict[str, Any]:
+    """Extended metadata for a multi-file reconstruction (V1.28).
+
+    Reads file 0's full extended metadata as the base, then overrides
+    just the fields tied to ``chain_axis`` so the combined dataset
+    reports the right total size and per-slice spacing/labels.
+
+    ``chain_mapping`` (V1.31) is a list of ``(file_idx, local_idx)``
+    pairs that defines the output order of slices on the chain axis.
+    When ``None``, files concatenate in basename order. When provided,
+    the per-axis overrides walk the mapping so timestamps / stage XY /
+    channel names / stage Z reflect the user-chosen order.
+    """
+    if not filepaths:
+        raise ValueError("read_nd2_metadata_extended_multi needs >=1 filepath")
+    if chain_axis not in ("T", "M", "Z", "C"):
+        raise ValueError(f"unknown chain_axis {chain_axis!r}")
+
+    import os as _os
+    paths = sorted(filepaths, key=lambda p: _os.path.basename(p))
+
+    # Per-file probes — we read full extended metadata for every file
+    # because the mapping may pull individual slices from any of them.
+    per_file_meta: List[Dict[str, Any]] = []
+    for p in paths:
+        try:
+            per_file_meta.append(read_nd2_metadata_extended(p))
+        except Exception:
+            per_file_meta.append({})
+
+    # Default natural mapping per axis: file by file, in-file order.
+    if chain_mapping is None:
+        attr_map = {
+            "T": "n_timepoints", "M": "n_multipoints",
+            "Z": "n_zslices", "C": "n_channels",
+        }
+        attr = attr_map[chain_axis]
+        chain_mapping = [
+            (fi, li) for fi, fm in enumerate(per_file_meta)
+            for li in range(int(fm.get(attr, 1)))
+        ]
+
+    base = dict(per_file_meta[0]) if per_file_meta[0] else read_nd2_metadata_extended(paths[0])
+    base["source_filepaths"] = list(paths)
+    base["chain_axis"] = chain_axis
+    base["chain_mapping"] = list(chain_mapping)
+    n_total = len(chain_mapping)
+
+    if chain_axis == "Z":
+        base["n_zslices"] = n_total
+        per_file_z: List[Optional[float]] = []
+        for p in paths:
+            try:
+                import nd2
+                with nd2.ND2File(p) as f:
+                    evts = list(f.events())
+                if evts:
+                    per_file_z.append(float(evts[0].get("Z Coord [µm]")) if evts[0].get("Z Coord [µm]") is not None else None)
+                else:
+                    per_file_z.append(None)
+            except Exception:
+                per_file_z.append(None)
+        zs_ordered = [per_file_z[fi] for fi, _li in chain_mapping
+                      if 0 <= fi < len(per_file_z) and per_file_z[fi] is not None]
+        if len(zs_ordered) >= 2:
+            diffs = np.diff(np.asarray(zs_ordered, dtype=np.float64))
+            step = float(np.mean(np.abs(diffs)))
+            if step > 0:
+                base["z_step_um"] = step
+                vox = base.get("voxel_size_um", (1.0, 1.0, 1.0))
+                base["voxel_size_um"] = (step, vox[1], vox[2])
+            base["stage_z_um"] = zs_ordered
+
+    elif chain_axis == "T":
+        base["n_timepoints"] = n_total
+        ts_ordered: List[float] = []
+        for fi, li in chain_mapping:
+            if not (0 <= fi < len(per_file_meta)):
+                ts_ordered.append(0.0)
+                continue
+            file_ts = per_file_meta[fi].get("frame_timestamps_s") or []
+            if 0 <= li < len(file_ts):
+                ts_ordered.append(float(file_ts[li]))
+            elif file_ts:
+                ts_ordered.append(float(file_ts[0]))
+            else:
+                ts_ordered.append(0.0)
+        base["frame_timestamps_s"] = ts_ordered
+
+    elif chain_axis == "M":
+        base["n_multipoints"] = n_total
+        xy_ordered: List[Tuple[float, float]] = []
+        for fi, li in chain_mapping:
+            if not (0 <= fi < len(per_file_meta)):
+                continue
+            file_xy = per_file_meta[fi].get("stage_xy_um") or []
+            if 0 <= li < len(file_xy):
+                xy_ordered.append(tuple(file_xy[li]))
+        if xy_ordered:
+            base["stage_xy_um"] = xy_ordered
+
+    elif chain_axis == "C":
+        base["n_channels"] = n_total
+        names: List[str] = []
+        exposures: List[Optional[float]] = []
+        emissions: List[Optional[float]] = []
+        excitations: List[Optional[float]] = []
+        colors: List[Optional[int]] = []
+        for fi, li in chain_mapping:
+            if not (0 <= fi < len(per_file_meta)):
+                continue
+            fm = per_file_meta[fi]
+
+            def _pick(lst, default=None):
+                lst = lst or []
+                return lst[li] if 0 <= li < len(lst) else default
+
+            names.append(_pick(fm.get("channel_names"), f"C{li}") or f"C{li}")
+            exposures.append(_pick(fm.get("channel_exposure_ms")))
+            emissions.append(_pick(fm.get("channel_emission_nm")))
+            excitations.append(_pick(fm.get("channel_excitation_nm")))
+            colors.append(_pick(fm.get("channel_colors")))
+        if names:
+            base["channel_names"] = names
+        if any(e is not None for e in exposures):
+            base["channel_exposure_ms"] = exposures
+        if any(e is not None for e in emissions):
+            base["channel_emission_nm"] = emissions
+        if any(e is not None for e in excitations):
+            base["channel_excitation_nm"] = excitations
+        if any(c is not None for c in colors):
+            base["channel_colors"] = colors
+
+    return base

@@ -32,6 +32,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Claude Code local settings
+.claude/
+
 # HPC generated files
 hpc/scripts/trial_list.txt
 hpc/scripts/*_batch*.slurm

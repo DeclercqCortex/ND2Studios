@@ -50,6 +50,11 @@ class LutHistogramWidget(QWidget):
         self._hist_counts: Optional[np.ndarray] = None
         self._hist_edges: Optional[np.ndarray] = None
         self._dragging: Optional[str] = None  # 'lo' or 'hi'
+        # True once set_contrast() has been called with explicit values
+        # (session restore or user interaction).  set_data() skips the
+        # auto-percentile step when this flag is set so that a restored
+        # LUT state is not overwritten.
+        self._contrast_explicitly_set: bool = False
 
         self._build_ui()
 
@@ -166,8 +171,9 @@ class LutHistogramWidget(QWidget):
         self._hist_counts = np.log1p(counts.astype(np.float32))
         self._hist_edges = edges
 
-        # Initialize lo/hi to the 0.5..99.5 percentile if not yet set.
-        if self._lo == 0.0 and self._hi == self._dtype_max:
+        # Auto-set to 0.5–99.5 percentile unless the caller has already
+        # programmed an explicit contrast (session restore or user drag).
+        if not self._contrast_explicitly_set:
             lo, hi = np.percentile(flat, [0.5, 99.5])
             self._lo = float(lo)
             self._hi = float(max(hi, lo + 1))
@@ -180,6 +186,7 @@ class LutHistogramWidget(QWidget):
         self._lo = float(lo)
         self._hi = float(hi)
         self._gamma = float(gamma)
+        self._contrast_explicitly_set = True
         self._sync_spinboxes()
         self.slider_gamma.blockSignals(True)
         self.slider_gamma.setValue(int(round(self._gamma * 100)))
