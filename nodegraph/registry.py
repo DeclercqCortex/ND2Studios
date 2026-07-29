@@ -118,6 +118,17 @@ class ModeSpec:
     GUI find it. ``derive`` is a metadata-intelligent default expression (e.g. the
     lever: ``"'3D' if n_z>1 else '2D'"``) — the toggle default is metadata-adaptive
     exactly like a value-socket default (V2.03 §1 / H9).
+
+    ``available_in`` (V2.12) gates one Mode on ANOTHER Mode's value, exactly as
+    :attr:`SocketSpec.available_in` gates a socket: ``{mode_name: {allowed values}}``,
+    ``None`` = always shown. It exists because a node that unifies several algorithms
+    behind one ``method`` Mode can have a *second* Mode only some methods read —
+    ``analysis.segment``'s ``level`` (the foreground cut) means nothing to its learned
+    detectors. Without gating that dropdown would sit there doing nothing, which is the
+    same "live-looking control the selected kernel ignores" the node charter forbids for
+    sockets. Gating is **edit-time only**: the resolved mode state still carries every
+    mode (a hidden one keeps its value) and still folds into the recipe hash, so hiding a
+    Mode never changes a memo key — the same rule as a hidden socket.
     """
 
     name: str
@@ -127,6 +138,7 @@ class ModeSpec:
     presentation: str = "body"
     role: str = ""
     derive: str = ""
+    available_in: Optional[Mapping[str, FrozenSet[str]]] = None
 
     def resolved_default(self) -> str:
         return self.default or (self.choices[0] if self.choices else "")
@@ -134,6 +146,13 @@ class ModeSpec:
     @property
     def is_dim_lever(self) -> bool:
         return self.role == "dim_lever"
+
+    def active_in(self, state: Mapping[str, str]) -> bool:
+        """True if this Mode is shown in mode ``state`` (V2.12) — mirrors
+        :meth:`SocketSpec.active_in`."""
+        if not self.available_in:
+            return True
+        return all(state.get(m) in allowed for m, allowed in self.available_in.items())
 
 
 @dataclass(frozen=True)
@@ -196,6 +215,12 @@ class NodeSpec:
 
     def active_sockets(self, state: Mapping[str, str]) -> tuple:
         return self.active_inputs(state) + self.active_outputs(state)
+
+    def active_modes(self, state: Mapping[str, str]) -> tuple:
+        """The Modes shown in ``state`` (V2.12). ``default_state`` deliberately still
+        includes the hidden ones: a gated-away Mode keeps its value, so the compute's
+        ``__modes__`` lookup and the memo key are unaffected by what the GUI draws."""
+        return tuple(m for m in self.modes if m.active_in(state))
 
     # ── footprint resolution (V2.03 §3 B3) ────────────────────────────────────
     def resolve_granularity(self, state: Mapping[str, str]) -> Optional[Granularity]:
@@ -287,9 +312,11 @@ def OutValue(name: str, t: SocketType, label: str = "", *, field: bool = True,
 
 
 def Mode(name: str, choices: Sequence[str], default: str = "", label: str = "",
-         *, presentation: str = "body", role: str = "", derive: str = "") -> ModeSpec:
+         *, presentation: str = "body", role: str = "", derive: str = "",
+         available_in: Optional[Mapping[str, FrozenSet[str]]] = None) -> ModeSpec:
     return ModeSpec(name, tuple(choices), default, label,
-                    presentation=presentation, role=role, derive=derive)
+                    presentation=presentation, role=role, derive=derive,
+                    available_in=available_in)
 
 
 def DimMode(*, default: str = "2D",

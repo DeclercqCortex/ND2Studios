@@ -19,5 +19,15 @@ pyarrow>=15.0      # Parquet / Arrow export + structure tables (lazily imported)
 #   pip install scikit-learn                 # analysis.cluster_points (GMM / KMeans+BIC)
 #   pip install numba pandas                 # track.objects (the 5-method tracker)
 #   pip install al-dic                       # analysis.dic_correlate (2D DIC, pyALDIC)
-#   pip install stardist tensorflow csbdeep  # detect.stardist_nuclei
+#   pip install stardist tensorflow csbdeep  # analysis.segment (method=stardist)
+#   pip install git+https://github.com/vanvalenlab/cellSAM.git   # analysis.segment
+#                                            #   (method=cellsam; pulls torch +
+#                                            #   segment_anything). THEN run:
+#                                            #     python scripts/setup_cellsam.py
+#                                            #   to fetch the ~1.7 GB weights once.
+#   pip install truststore                   # only if your machine intercepts HTTPS
+#                                            #   (corporate proxy / antivirus): lets the
+#                                            #   weights download verify against the OS
+#                                            #   trust store. setup_cellsam.py detects
+#                                            #   the case and tells you.
 #   pip install zarr                         # scripts/_bench_provider_granularity.py only

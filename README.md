@@ -10,6 +10,11 @@ pip install -r requirements.txt
 python run.py
 ```
 
+**Docs:** [MANUAL.md](MANUAL.md) — how to use it (window, workflows, all 54 nodes, shortcuts,
+troubleshooting). [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md)
+— how it works (data model, node contracts, domains/bridges, metadata intelligence, engine,
+memo, streaming, GUI seam, invariants).
+
 ## What makes it different
 
 - **Metadata-intelligent nodes.** Every spatial/temporal parameter carries a unit and a
@@ -81,7 +86,21 @@ calibration through `ctx.calib` so it folds into the memo, and land an end-to-en
 
 Python 3.13, PySide6, numpy, scipy, scikit-image, blosc2, zarr, pyarrow, nd2, tifffile.
 Optional, feature-gated at import: scikit-learn (point clustering), al-dic (2D DIC),
-tensorflow + stardist (DL nuclei), numba + pandas (the 5-method tracker), cupy.
+tensorflow + stardist and cellSAM + torch (the learned Segmentation methods),
+numba + pandas (the 5-method tracker), cupy.
+
+**CellSAM** needs its weights fetched once per machine (~1.7 GB, non-commercial academic
+licence, so they cannot ship here):
+
+```bash
+pip install git+https://github.com/vanvalenlab/cellSAM.git
+python scripts/setup_cellsam.py     # prompts for a users.deepcell.org token, verifies md5
+python scripts/_cellsam_smoke.py    # end-to-end check
+```
+
+Loading is offline afterwards. If your machine intercepts HTTPS (corporate proxy /
+antivirus), the script detects it and points you at `pip install truststore`. See
+[MANUAL.md §1](MANUAL.md#1-install--launch).
 
 ## History
 

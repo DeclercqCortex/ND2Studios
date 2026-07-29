@@ -1695,93 +1695,517 @@ def _labeled_table(raster: np.ndarray, *, m: int, t: int, c: int, layer: str,
     return StructureTable(Domain.LABEL, cols, layer=layer, z_kind=zk)
 
 
-def _compute_watershed(ctx: EvalContext) -> Dataset:
-    """Split a Voxel mask into touching regions by seeding a watershed at the peaks of
-    the (anisotropic) distance transform — the classic "separate touching objects"
-    step. Emits a global-unique Label raster + table, like Connected Components but
-    splitting merged blobs. Markers ← ``peak_local_max`` on the EDT; ids are marker
-    ids (stable per plane/volume). 2D per-plane, 3D volumetric."""
+# ── Segmentation — the ONE image→instance-labels node (`method` = the algorithm) ─
+#
+# V2.12. Every segmentation shares one data contract: an image in, a Voxel **label
+# raster** + a per-object **Label table** out, with globally-unique ids. Only the
+# algorithm that finds the objects differs. So the catalog carries ONE Segmentation node
+# with a ``method`` Mode instead of one node per algorithm: ``analysis.watershed`` and
+# ``detect.stardist_nuclei`` were folded in here and deleted, **CellSAM** is new, and
+# every shared stage — the µm²/µm³ size filter, hole filling, the contiguous relabel, the
+# global id offset, the Label table, the 2D/3D lever — is written exactly ONCE instead of
+# once per method (which is how the old pair drifted: stardist filtered by area and
+# watershed did not, stardist had no lever and watershed did).
+#
+# The methods are deliberately heterogeneous in what they need, and ``available_in`` keeps
+# each method's controls to itself (wire-node-v2 §5b): two classical methods that cut a
+# foreground and split it (``threshold``, ``watershed``) and two learned detectors that
+# take an image and return instances directly (``stardist``, ``cellsam``).
+
+_SEGMENT_METHODS = ("threshold", "watershed", "stardist", "cellsam")
+#: Foreground level for the classical methods — the `analysis.threshold` menu, defaulting
+#: to `otsu` because a segmentation node should work on an unseen image with no numbers.
+_SEGMENT_LEVELS = ("otsu", "li", "yen", "triangle", "mean", "fixed")
+#: Methods that CUT a foreground and therefore read the level controls.
+_SEGMENT_CLASSICAL = frozenset({"threshold", "watershed"})
+#: Methods whose backend is a 2-D-per-plane detector (StarDist2D; CellSAM's ViT + SAM
+#: decoder). They cannot produce z-connected 3D instances, so 3D mode is REFUSED rather
+#: than quietly returning a stack of per-plane labels while the lever claims 3D
+#: (wire-node-v2 §5 — never silently loop 2D over Z while claiming 3D). 3D consensus
+#: fusion of 2D slices is a real algorithm (u-Segment3D, CellSAM paper Fig. 3d), not
+#: something to fake here.
+_SEGMENT_2D_ONLY = frozenset({"stardist", "cellsam"})
+
+
+def _segment_level(arr: np.ndarray, level: str, fixed: float) -> float:
+    """The foreground cut for ONE segmentation unit (a plane in 2D, a volume in 3D).
+
+    ``fixed`` is the user's level in the image's own intensity units; every other choice
+    derives it from that unit's own histogram — **per unit**, which is what the node's
+    declared footprint says it reads (WHOLE_PLANE in 2D / WHOLE_VOLUME in 3D). One level
+    for the whole dataset is a different (also valid) recipe, and it is what
+    ``analysis.threshold`` does: compose it with this node's ``watershed`` ``mask`` socket
+    when you want a single global cut.
+
+    A flat unit gets no histogram level: skimage's methods return the constant itself (or
+    warn and divide by zero), and a cut AT the constant paints the WHOLE plane as one
+    giant object. Returning just above the maximum yields an empty foreground, which is
+    the honest answer for a blank plane.
+
+    **Non-finite pixels are excluded from the histogram** (V2.12): a SINGLE NaN or inf —
+    which a deconvolution, a normalize of a flat region or a resampled edge can produce —
+    otherwise makes every skimage method raise ``autodetected range … is not finite``, and
+    NaN also defeats the flat-unit guard above (``nan == nan`` is False). Cutting on the
+    finite population is the useful answer; NaN voxels then fall out of the foreground on
+    their own, since ``nan > level`` is False."""
+    if level == "fixed":
+        return float(fixed)
+    import skimage.filters as skf
+    fn = {"otsu": skf.threshold_otsu, "li": skf.threshold_li, "yen": skf.threshold_yen,
+          "triangle": skf.threshold_triangle, "mean": skf.threshold_mean}[level]
+    flat = np.asarray(arr, dtype=float).ravel()      # 1-D (skimage RGB-shape guard)
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        return float("inf")                          # nothing to cut ⇒ empty foreground
+    lo, hi = float(finite.min()), float(finite.max())
+    if lo == hi:
+        return hi + 1.0                              # blank unit ⇒ empty foreground
+    return float(fn(finite))
+
+
+def _segment_fill_holes(raster: np.ndarray) -> np.ndarray:
+    """Fill each label region's interior holes — the "hole filling" half of the
+    postprocess Cellpose and CellSAM both apply (CellSAM, *Nat. Methods* 22:2585, Methods
+    → "CellSAM postprocessing"), here shared by every method.
+
+    **Non-destructive**, unlike the upstream idiom. Cellpose's
+    ``fill_holes_and_remove_small_masks`` writes ``masks[slc][filled] = id`` across the
+    object's whole bounding box, which steals voxels that already belong to a NEIGHBOURING
+    label whenever two objects share a box. Only voxels that are currently background are
+    painted here, so filling can never move a boundary between two objects."""
+    from scipy import ndimage as ndi
+    out = np.asarray(raster)
+    if out.size == 0 or int(out.max()) == 0:
+        return out
+    out = out.copy()
+    for i, slc in enumerate(ndi.find_objects(out), start=1):
+        if slc is None:                              # id absent (non-contiguous labels)
+            continue
+        sub = out[slc]                               # a VIEW — assignment writes through
+        holes = ndi.binary_fill_holes(sub == i) & (sub == 0)
+        if holes.any():
+            sub[holes] = i
+    return out
+
+
+def _segment_size_filter(raster: np.ndarray, min_px: int, max_px: int) -> np.ndarray:
+    """Drop objects outside ``[min_px, max_px]`` **voxels** (inclusive; ``0`` disables
+    either bound) and relabel the survivors ``1..K`` — one ``O(voxels)`` bincount + LUT
+    pass, the shape of ``stardist_segment.filter_and_relabel``.
+
+    The relabel runs even with both bounds off, and that is load-bearing: the caller makes
+    ids globally unique by adding a running offset per unit, which is only correct if each
+    unit's own ids are contiguous from 1."""
+    lab = np.asarray(raster).astype(np.int64, copy=False)
+    top = int(lab.max()) if lab.size else 0
+    if top == 0:
+        return np.zeros(lab.shape, dtype=np.int64)
+    counts = np.bincount(lab.ravel(), minlength=top + 1)
+    keep = counts > 0
+    keep[0] = False                                  # background is never an object
+    if min_px > 0:
+        keep &= counts >= min_px
+    if max_px > 0:
+        keep &= counts <= max_px
+    lut = np.zeros(top + 1, dtype=np.int64)
+    lut[np.flatnonzero(keep)] = np.arange(1, int(keep.sum()) + 1, dtype=np.int64)
+    return lut[lab]
+
+
+def _segment_watershed_split(fg: np.ndarray, sampling, footprint: np.ndarray) -> np.ndarray:
+    """Split a foreground mask into touching objects by seeding a watershed at the peaks
+    of the (anisotropic) distance transform — the classic "separate touching objects" step,
+    carried over verbatim from the folded-in ``analysis.watershed``.
+
+    Peak suppression is a **physical** radius expressed as a per-axis ``footprint``, not
+    the isotropic index-unit ``min_distance``: on an anisotropic volume (z_step > pixel)
+    an index-unit radius suppresses far too aggressively along Z and under-segments.
+
+    **Adjacent peaks are ONE marker** (V2.12 fix). A distance transform is full of
+    plateaus — a disk on an integer grid has several pixels at the same maximum, and an
+    elongated object has a whole ridge of them — and ``peak_local_max`` returns *every*
+    pixel of a plateau. The folded-in ``analysis.watershed`` numbered each returned pixel
+    as its own marker, so one object was shattered into as many basins as its plateau had
+    pixels (measured: four synthetic disks became 19 fragments per plane, the smallest of
+    them 1 voxel). Connected-component labelling the peak mask first — the recipe from
+    scikit-image's own watershed example — collapses each plateau to a single seed while
+    leaving genuinely distinct maxima separate, which is the whole point of the node.
+
+    That merge uses **full** connectivity (8 in 2D / 26 in 3D), not scipy's cross-shaped
+    default: a plateau is frequently a diagonal ring — the equidistant crest inside any
+    object with a hole in it — and a cross-connected label breaks such a ring into one
+    marker per diagonal step (the same four disks then yield 11 basins instead of 4).
+
+    **`exclude_border=False` is load-bearing** (V2.12 fix). ``peak_local_max`` defaults to
+    excluding a border shell ``min_distance`` wide on EVERY axis — and ``min_distance`` is a
+    parameter this call does not even use, since the physical suppression is the per-axis
+    ``footprint``. Leaving the default on discards peaks near the frame edge, and in 3D on a
+    volume with ``z <= 2`` there is **no interior z plane at all**, so it returns ZERO peaks:
+    the fallback below then plants a single marker and the watershed collapses every object
+    in the volume into one (measured on two disjoint disks over z=1 and z=2 — 1 object
+    instead of 2, silently). Objects at the image border are real objects."""
     from scipy import ndimage as ndi
     from skimage.feature import peak_local_max
+    if not fg.any():
+        return np.zeros(fg.shape, dtype=np.int64)
+    edt = ndi.distance_transform_edt(fg, sampling=sampling)
+    peaks = peak_local_max(edt, footprint=footprint, labels=fg.astype(np.int64),
+                           exclude_border=False)
+    seeds = np.zeros(fg.shape, dtype=bool)
+    if len(peaks):
+        seeds[tuple(np.asarray(peaks).T)] = True
+    full = ndi.generate_binary_structure(seeds.ndim, seeds.ndim)
+    markers = np.asarray(ndi.label(seeds, structure=full)[0], dtype=np.int64)
+    if markers.max() == 0:                           # no separable peak → one basin
+        markers[np.unravel_index(int(np.argmax(edt)), edt.shape)] = 1
+    return np.asarray(seeded_watershed(fg, markers, sampling=sampling), dtype=np.int64)
+
+
+def _compute_segment(ctx: EvalContext) -> Dataset:
+    """**Segmentation** — image → a Voxel **label raster** + a per-object **Label table**
+    (ids globally unique across every unit); ``method`` picks the algorithm.
+
+    THE segmentation node. Input and output domains are identical for every method, so the
+    algorithm is a Mode rather than a separate node type, and the surrounding stages are
+    shared:
+
+    ``method``
+        * **threshold** — cut a foreground at ``level`` (otsu/li/yen/triangle/mean, or a
+          ``fixed`` level in the image's own units) and connected-component label it
+          (``connectivity`` 4/8 in 2D, 6/18/26 in 3D; ``0`` = per-dim default).
+        * **watershed** — the same foreground, split at the peaks of the anisotropic
+          distance transform (``min_distance``, µm). An existing binary/label layer can be
+          used as the foreground instead by naming it in ``mask`` — that is how the
+          removed ``analysis.watershed`` behaved, and it is what to use when the mask comes
+          from ``analysis.threshold`` / ``analysis.roi_mask`` /
+          ``analysis.histogram_threshold``.
+        * **stardist** — StarDist star-convex CNN (``prob_thresh``/``nms_thresh``/
+          ``scale``/``model_name``), kernel :mod:`nodegraph.kernels.stardist_segment`.
+        * **cellsam** — CellSAM: a SAM ViT-B whose mask decoder is prompted by CellFinder
+          (Anchor-DETR) box detections, i.e. a *generalist* segmenter that needs no
+          per-dataset tuning and no seeds (``bbox_threshold`` is the precision/recall
+          knob; ``normalize``/``postprocess``/``remove_boundaries``/``tile``…), kernel
+          :mod:`nodegraph.kernels.cellsam_segment`.
+
+    Shared by all four: the output layer ``name`` (one name, two domains — the Voxel
+    raster and the Label table), hole filling, the size filter in **µm² (2D) / µm³ (3D)**,
+    the contiguous relabel, the global id offset, and the Label table's invariant
+    ``id,m,t,c,area,z,y,x`` schema with ``area`` in voxels.
+
+    **2D vs 3D is what the lever means here:** 2D segments each ``(m,t,z,c)`` plane
+    independently and emits per-plane instances (``z_kind="plane_index"``); 3D segments
+    each ``(m,t,c)`` volume and emits z-connected instances (``z_kind="subpixel"``). The
+    two learned methods are 2-D-per-plane detectors and **refuse** 3D rather than
+    pretending a stack of per-plane labels is a 3D segmentation.
+
+    Reads ``pixel_size_um`` (and ``z_step_um`` in 3D) for the size filter and the seed
+    radius; both are recorded, so the memo re-checks them.
+
+    Per-channel: each channel is segmented independently, as every other structure
+    producer in the catalog does. CellSAM's ``(blank, nuclear, whole-cell)`` multi-channel
+    fusion is deliberately NOT exposed — a fused segmentation has no single ``c`` to file
+    its Label rows under, and inventing one silently would corrupt every downstream
+    per-channel join. Select the marker channel upstream (``channel.select``)."""
     ds = ctx.inputs[0]
-    ax = ds.axes
+    prov = ds.image
+    if prov is None:
+        raise ValueError("segmentation needs an image provider on its input Dataset")
+    ax = prov.axes
     is_3d = ctx.is_volume
-    mask_attr = ds.get(Domain.VOXEL, ctx.layer("mask"))
-    if mask_attr is None:
-        raise ValueError(f"watershed needs a Voxel mask {ctx.params.get('mask', 'mask')!r}")
-    mask6 = mask_attr.values
-    min_um = float(ctx.params.get("min_distance", 0.3))
-    px = ctx.calib("pixel_size_um") or 0.1
-    rxy = max(1, int(round(min_um / px)))               # lateral suppression radius (px)
+    modes = ctx.params.get("__modes__", {})
+    method = str(modes.get("method") or "threshold")
+    if method not in _SEGMENT_METHODS:
+        raise ValueError(f"unknown segmentation method {method!r} — one of "
+                         f"{list(_SEGMENT_METHODS)}")
+    if is_3d and method in _SEGMENT_2D_ONLY:
+        raise ValueError(
+            f"segmentation: {method!r} is a 2-D-per-plane detector and cannot produce "
+            "z-connected 3D instances. Set the 2D/3D lever to 2D to segment every plane "
+            "independently (per-plane instances), or z-project first. (Fusing 2D slices "
+            "into true 3D objects is its own algorithm — u-Segment3D in the CellSAM "
+            "paper — not something this node fakes.) The `threshold` and `watershed` "
+            "methods do run volumetrically in 3D.")
     layer = ctx.layer("name")
-    raster = np.zeros_like(mask6, dtype=np.int64)
+
+    # ── the shared size filter: µm² (2D) / µm³ (3D) → voxels ──────────────────
+    px = ctx.calib("pixel_size_um") or 0.1
+    # The four size params are read with LITERAL keys, per dim, deliberately: the socket
+    # contract's index is an AST pass that only resolves string constants (and helper args),
+    # so a `ctx.params.get(key_variable)` read would make all four sockets look DEAD and
+    # fail the guard — the one place where saying it twice is required, not sloppy.
+    if is_3d:
+        zs = ctx.calib("z_step_um") or 0.5
+        vox, unit, lo_key, hi_key = px * px * zs, "µm³", "min_volume", "max_volume"
+        lo_um = float(ctx.params.get("min_volume", 0.0))
+        hi_um = float(ctx.params.get("max_volume", 0.0))
+    else:
+        vox, unit, lo_key, hi_key = px * px, "µm²", "min_area", "max_area"
+        lo_um = float(ctx.params.get("min_area", 0.0))
+        hi_um = float(ctx.params.get("max_area", 0.0))
+    min_px, max_px = int(round(lo_um / vox)), int(round(hi_um / vox))
+    # 0 is the OFF sentinel for both bounds, which is safe for the lower one (every object
+    # has at least one voxel, so a sub-voxel minimum filters nothing either way) but
+    # INVERTS the upper one: a sub-voxel maximum would quantize to "no upper limit" and
+    # keep everything instead of dropping all but sub-voxel specks. Refuse, exactly as
+    # analysis.histogram_threshold does with the same arithmetic.
+    if hi_um > 0.0 and max_px == 0:
+        raise ValueError(
+            f"segmentation: {hi_key}={hi_um:g} {unit} is under one voxel ({vox:g} {unit}) "
+            f"— it quantizes to 0, which is this filter's OFF value, so it would keep "
+            f"every object instead of dropping the large ones. Raise it, or set exactly 0 "
+            f"to disable the upper bound deliberately.")
+    if max_px > 0 and min_px > max_px:
+        raise ValueError(
+            f"segmentation: {lo_key} ({min_px} voxels) exceeds {hi_key} ({max_px} voxels) "
+            f"— the size window is empty, so every object would be discarded. Widen it "
+            f"({hi_key} 0 = no upper limit).")
+    fill = bool(ctx.params.get("fill_holes", False))
+
+    # ── per-method setup (everything read here, once, not per unit) ────────────
+    level = str(modes.get("level") or "otsu")
+    fixed = 0.5
+    conn = 26 if is_3d else 8
+    mask6 = None
+    footprint = None
+    sampling = (zs, px, px) if is_3d else (px, px)
+    if method in _SEGMENT_CLASSICAL:
+        if level not in _SEGMENT_LEVELS:
+            raise ValueError(f"unknown threshold level {level!r} — one of "
+                             f"{list(_SEGMENT_LEVELS)}")
+        # unset ⇒ the socket's derive: mid-range of the CURRENT declared bit depth, or 0.5
+        # when there is none (post-Normalize [0,1] data). channel(0) because the depth is
+        # channel-independent (§7c).
+        fixed = float(ctx.channel(0).param("threshold", 0.5))
+    if method == "threshold":
+        # A QSpinBox cannot express "unset", so it commits 0 the moment it is touched —
+        # and 0 is not a legal connectivity. Treat it as "per-dim default" instead of
+        # letting `_connectivity_rank` raise on a value the user never chose.
+        conn = int(ctx.params.get("connectivity", 0) or 0) or (26 if is_3d else 8)
+    if method == "watershed":
+        src = ctx.layer("mask")
+        if src:
+            attr = ds.get(Domain.VOXEL, src)
+            if attr is None:
+                raise ValueError(
+                    f"segmentation (watershed): no Voxel layer {src!r} to use as the "
+                    "foreground. Pick an existing mask/label layer, or clear the `mask` "
+                    "socket to cut the foreground from the image with the level controls.")
+            mask6 = np.asarray(attr.values)
+        min_um = float(ctx.params.get("min_distance", 0.3))
+        rxy = max(1, int(round(to_pixels_v2(min_um, "um", pixel_size_um=px))))
+        if is_3d:
+            rz = max(1, int(round(to_pixels_v2(min_um, "um_axial", z_step_um=zs))))
+            footprint = np.ones((2 * rz + 1, 2 * rxy + 1, 2 * rxy + 1), dtype=bool)
+        else:
+            footprint = np.ones((2 * rxy + 1, 2 * rxy + 1), dtype=bool)
+
+    model = None
+    model_id = ""
+    if method == "stardist":
+        from nodegraph.kernels.stardist_segment import get_stardist_model, segment_frame
+        model_id = str(ctx.params.get("model_name") or "2D_versatile_fluo")
+        prob = ctx.params.get("prob_thresh")
+        prob = float(prob) if prob not in (None, "") else 0.5
+        nms = float(ctx.params.get("nms_thresh", 0.3))
+        scale = ctx.params.get("scale")
+        scale = float(scale) if scale not in (None, "") else 0.0
+        scale = scale if scale > 0 else None          # a 0 spin-box means "no rescale"
+        # `disable_gpu` is an ENVIRONMENT knob, never a socket: the loader is a process
+        # singleton that ignores the flag after the first call, and TF must see
+        # CUDA_VISIBLE_DEVICES before its first import. As a param it would be a control
+        # that silently stops working, and it would make the memo non-deterministic
+        # (identical recipe hash, different device). Same argument as NODELAB_CELLSAM_DEVICE.
+        import os as _os
+        _cpu = _os.environ.get("NODELAB_STARDIST_CPU", "") in ("1", "true", "yes")
+        try:
+            model = get_stardist_model(model_id, disable_gpu=_cpu)
+        except Exception as exc:                      # noqa: BLE001 — one clear message
+            raise ImportError(f"StarDist model {model_id!r} unavailable "
+                              f"(tensorflow/stardist/csbdeep + weights): {exc}") from exc
+    if method == "cellsam":
+        from nodegraph.kernels.cellsam_segment import get_cellsam_model, segment_plane
+        model_id = str(ctx.params.get("cellsam_model") or "cellsam_general")
+        weights = str(ctx.params.get("model_path") or "")
+        cs = dict(bbox_threshold=float(ctx.params.get("bbox_threshold", 0.4)),
+                  normalize=bool(ctx.params.get("normalize", True)),
+                  postprocess=bool(ctx.params.get("postprocess", False)),
+                  remove_boundaries=bool(ctx.params.get("remove_boundaries", False)),
+                  tile=bool(ctx.params.get("tile", False)),
+                  tile_size=int(ctx.params.get("tile_size", 512)),
+                  overlap=int(ctx.params.get("tile_overlap", 56)))
+        # Loaded ONCE for the whole pull (a checkpoint read + ViT build per plane would
+        # dominate a time series); the kernel keys its singleton on (model, path, device).
+        model = get_cellsam_model(model_id, model_path=weights)
+        if weights:
+            # `model_path` WINS inside the kernel (get_local_model), so the provenance must
+            # name the checkpoint that actually ran, not the published-model socket the
+            # loader ignored.
+            model_id = weights
+
+    # ── the unit loop: one segmentation per plane (2D) / per volume (3D) ───────
+    def segment_unit(arr: np.ndarray, unit: tuple) -> np.ndarray:
+        """One prepared unit → a label array of the same shape, ids contiguous from 1."""
+        m, t, c = unit[0], unit[1], unit[-1]
+        z = unit[2] if len(unit) == 4 else None
+        if method == "stardist":
+            return np.asarray(segment_frame(arr.astype(np.float32), model=model,
+                                            prob_thresh=prob, nms_thresh=nms,
+                                            scale=scale)[0], dtype=np.int64)
+        if method == "cellsam":
+            return np.asarray(segment_plane(arr, model=model, **cs), dtype=np.int64)
+        if mask6 is not None:
+            fg = (mask6[m, t, :, c] if z is None else mask6[m, t, z, c]) != 0
+        else:
+            fg = arr > _segment_level(arr, level, fixed)
+            if arr.dtype.kind == "f":
+                # A non-finite voxel is "no valid measurement here", so it is background —
+                # never an object. NaN falls out on its own (`nan > level` is False) but
+                # `inf > level` is True, and an inf from a deconvolution or a 0/0 would
+                # otherwise appear as a phantom one-voxel cell in the table. Treating the
+                # two the same is the only defensible reading; the guard is skipped on an
+                # integer image, which cannot carry either.
+                fg &= np.isfinite(arr)
+        if method == "watershed":
+            return _segment_watershed_split(fg, sampling, footprint)
+        return np.asarray(label_components(fg, conn)[0], dtype=np.int64)
+
+    raster = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=np.int64)
     cols: Dict[str, list] = defaultdict(list)
     offset = 0
 
-    def split(fg: np.ndarray, sampling, footprint: np.ndarray) -> np.ndarray:
-        if not fg.any():
-            return np.zeros(fg.shape, dtype=np.int64)
-        edt = ndi.distance_transform_edt(fg, sampling=sampling)
-        # peak suppression must be a PHYSICAL radius: a per-axis `footprint` (not the
-        # isotropic index-unit `min_distance`), else an anisotropic volume suppresses
-        # far too aggressively along Z (z_step > px) and under-segments (review).
-        peaks = peak_local_max(edt, footprint=footprint, labels=fg.astype(np.int64))
-        markers = np.zeros(fg.shape, dtype=np.int64)
-        for i, p in enumerate(peaks, start=1):
-            markers[tuple(p)] = i
-        if markers.max() == 0:                       # no separable peak → one basin
-            markers[np.unravel_index(int(np.argmax(edt)), edt.shape)] = 1
-        return np.asarray(seeded_watershed(fg, markers, sampling=sampling), dtype=np.int64)
-
-    def take(lab: np.ndarray, z_index: int, m: int, t: int, c: int) -> np.ndarray:
+    def take(lab: np.ndarray, m: int, t: int, c: int, z_index: int) -> np.ndarray:
+        """Clean up one unit's labels, append its Label rows, and shift its ids into the
+        globally-unique range."""
         nonlocal offset
-        tbl = _labeled_table(lab, m=m, t=t, c=c, layer=layer, is_3d=is_3d, z_index=z_index)
+        lab = _segment_size_filter(_segment_fill_holes(lab) if fill else lab,
+                                   min_px, max_px)
+        tbl = _labeled_table(lab, m=m, t=t, c=c, layer=layer, is_3d=is_3d,
+                             z_index=z_index)
         for k, v in tbl.columns.items():
             cols[k].extend(((v + offset) if k == "id" else v).tolist())
         shifted = np.where(lab > 0, lab + offset, 0)
         offset += tbl.n
         return shifted
 
-    fp2 = np.ones((2 * rxy + 1, 2 * rxy + 1), dtype=bool)          # isotropic lateral
+    note = "segmenting (%s)" % method
     if is_3d:
-        zs = ctx.calib("z_step_um") or 0.5
-        rz = max(1, int(round(min_um / zs)))                       # axial radius (z-steps)
-        fp3 = np.ones((2 * rz + 1, 2 * rxy + 1, 2 * rxy + 1), dtype=bool)
-    for m in range(ax.m):
-        for t in range(ax.t):
-            for c in range(ax.c):
-                if is_3d:
-                    lab = split(mask6[m, t, :, c] != 0, (zs, px, px), fp3)
-                    raster[m, t, :, c] = take(lab, 0, m, t, c)
-                else:
-                    for z in range(ax.z):
-                        lab = split(mask6[m, t, z, c] != 0, (px, px), fp2)
-                        raster[m, t, z, c] = take(lab, z, m, t, c)
+        for m, t, c in _each_volume_p(ctx, ax, note):
+            vol = prov.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x)
+            raster[m, t, :, c] = take(segment_unit(vol, (m, t, c)), m, t, c, 0)
+    else:
+        for m, t, z, c in _each_plane_p(ctx, ax, note):
+            plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x)
+            raster[m, t, z, c] = take(segment_unit(plane, (m, t, z, c)), m, t, c, z)
+
     out = ds.with_layer(Domain.VOXEL, layer, raster)
     if cols.get("id"):
         out = out.with_structure(StructureTable(
             Domain.LABEL, {k: np.array(v) for k, v in cols.items()},
             layer=layer, z_kind=("subpixel" if is_3d else "plane_index")))
-    return out
+    # Provenance (§7b), the `track.objects` shape: namespaced non-calibration keys naming
+    # HOW these labels were made, so a downstream node or a reader can tell a CNN
+    # segmentation from a threshold without re-deriving it.
+    prov_md = {"segment_method": method}
+    if model_id:
+        prov_md["segment_model"] = model_id
+    return out.with_metadata(**prov_md)
 
 
 register_node(
-    _compute_watershed, op_key="analysis.watershed", label="Watershed",
-    reads_domains=frozenset({Domain.VOXEL}),
-    adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),   # emits a label RASTER too
+    _compute_segment, op_key="analysis.segment", label="Segmentation",
     category="analysis",
-    inputs=[InDataset(),
-            InString("mask", "Mask layer", field=False, default="mask",
-                     layer_in=Domain.VOXEL),
-            InFloat("min_distance", "Min seed distance", unit="um", field=True,
-                    default=0.3),
-            InString("name", "Output layer", field=False, default="watershed",
-                     layer_out=(Domain.VOXEL, Domain.LABEL))],
-    outputs=[OutDataset()], modes=[DimMode()],
-    granularity={"2D": Granularity.WHOLE_PLANE, "3D": Granularity.WHOLE_VOLUME},
-    kernel_axes=_DIM_KAX,
-    description="Split touching mask regions via distance-transform-seeded watershed "
-                "→ global-unique Labels; 2D per-plane vs 3D volumetric.")
+    reads_domains=frozenset({Domain.VOXEL}),
+    adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),   # a label RASTER and a table
+    inputs=[
+        InDataset(),
+        # ── shared by every method ────────────────────────────────────────────
+        InString("name", "Output layer", field=False, default="labels",
+                 layer_out=(Domain.VOXEL, Domain.LABEL)),
+        InBool("fill_holes", "Fill holes", field=False, default=False),
+        # A 2D object has an area and a 3D object has a volume — different units, so
+        # different sockets rather than one whose meaning silently changes with the lever.
+        InFloat("min_area", "Min area", unit="um2", field=False, default=0.0,
+                available_in={"dim": frozenset({"2D"})}),
+        InFloat("max_area", "Max area", unit="um2", field=False, default=0.0,
+                available_in={"dim": frozenset({"2D"})}),
+        InFloat("min_volume", "Min volume", unit="um3", field=False, default=0.0,
+                available_in={"dim": frozenset({"3D"})}),
+        InFloat("max_volume", "Max volume", unit="um3", field=False, default=0.0,
+                available_in={"dim": frozenset({"3D"})}),
+        # ── threshold + watershed: the foreground cut ─────────────────────────
+        # a FIXED level is in the image's own units, so its default follows the declared
+        # intensity scale: mid-range of the current bit depth (2047.5 on 12-bit), falling
+        # back to 0.5 when there is no declared integer scale — i.e. exactly after a
+        # Normalize dropped it (wire-node-v2 §7c).
+        InFloat("threshold", "Level", unit="", field=False, default=0.5,
+                derive="((2**bit_depth - 1)/2) if bit_depth else 0.5",
+                available_in={"method": frozenset({"threshold", "watershed"}),
+                              "level": frozenset({"fixed"})}),
+        # ── threshold only ───────────────────────────────────────────────────
+        InInt("connectivity", "Connectivity", unit="", field=False, default=0,
+              available_in={"method": frozenset({"threshold"})}),
+        # ── watershed only ───────────────────────────────────────────────────
+        # EMPTY by default: a Segmentation node segments the image. Naming a layer here
+        # splits THAT foreground instead (the folded-in `analysis.watershed` behaviour).
+        InString("mask", "Foreground layer", field=False, default="",
+                 layer_in=Domain.VOXEL,
+                 available_in={"method": frozenset({"watershed"})}),
+        InFloat("min_distance", "Min seed distance", unit="um", field=False, default=0.3,
+                available_in={"method": frozenset({"watershed"})}),
+        # ── stardist only ────────────────────────────────────────────────────
+        InFloat("prob_thresh", "Prob threshold", unit="", field=False, default=0.5,
+                available_in={"method": frozenset({"stardist"})}),
+        InFloat("nms_thresh", "NMS threshold", unit="", field=False, default=0.3,
+                available_in={"method": frozenset({"stardist"})}),
+        InFloat("scale", "Scale", unit="", field=False, default=0.0,
+                available_in={"method": frozenset({"stardist"})}),
+        InString("model_name", "StarDist model", field=False,
+                 default="2D_versatile_fluo",
+                 available_in={"method": frozenset({"stardist"})}),
+        # ── cellsam only (socket names stay disjoint from stardist's: the node card
+        #    relayouts on the active socket NAME list, so a same-named socket with a
+        #    different default would not redraw when the method changes) ─────────
+        InFloat("bbox_threshold", "Box threshold", unit="", field=False, default=0.4,
+                available_in={"method": frozenset({"cellsam"})}),
+        InString("cellsam_model", "CellSAM model", field=False,
+                 default="cellsam_general",
+                 available_in={"method": frozenset({"cellsam"})}),
+        InString("model_path", "Local weights", field=False, default="",
+                 available_in={"method": frozenset({"cellsam"})}),
+        InBool("normalize", "Normalize", field=False, default=True,
+               available_in={"method": frozenset({"cellsam"})}),
+        InBool("postprocess", "Postprocess", field=False, default=False,
+               available_in={"method": frozenset({"cellsam"})}),
+        InBool("remove_boundaries", "Separate touching", field=False, default=False,
+               available_in={"method": frozenset({"cellsam"})}),
+        # Tiling is a memory/compute knob in the MODEL's own pixel space (CellSAM resizes
+        # every tile to 1024²), not a physical extent — hence `px`, declared rather than
+        # hidden as a bare constant. `tile_size`/`tile_overlap` stay visible while `tile`
+        # is off because liveness that depends on another SOCKET's value cannot be
+        # expressed in `available_in`, which sees mode state only (wire-node-v2 §5b).
+        InBool("tile", "Tiled inference", field=False, default=False,
+               available_in={"method": frozenset({"cellsam"})}),
+        InInt("tile_size", "Tile size", unit="px", field=False, default=512,
+              available_in={"method": frozenset({"cellsam"})}),
+        InInt("tile_overlap", "Tile overlap", unit="px", field=False, default=56,
+              available_in={"method": frozenset({"cellsam"})}),
+    ],
+    outputs=[OutDataset()],
+    modes=[DimMode(),
+           Mode("method", list(_SEGMENT_METHODS), default="threshold", label="Method"),
+           # the foreground cut belongs to the classical methods only — a learned detector
+           # never thresholds, so the dropdown is GATED AWAY rather than shown and ignored
+           # (V2.12 `ModeSpec.available_in`, the Mode-level half of wire-node-v2 §5b).
+           Mode("level", list(_SEGMENT_LEVELS), default="otsu", label="Level",
+                available_in={"method": frozenset(_SEGMENT_CLASSICAL)})],
+    granularity=_DIM_GRAN_GLOBAL, kernel_axes=_DIM_KAX,
+    description="THE segmentation node: image → a Voxel label raster + a Label table, "
+                "with the algorithm as a `method` Mode — threshold+CCL, "
+                "distance-transform watershed, StarDist (CNN), or CellSAM (SAM + "
+                "CellFinder foundation model). Shared across every method: hole filling, "
+                "the µm²/µm³ size filter, globally-unique ids and the region table. 2D "
+                "segments each plane independently, 3D each volume (the two learned "
+                "methods are 2D-per-plane and refuse the 3D lever).")
 
 
 # ── Resample (axis-changing: rescale Y,X and, in 3D, Z) ─────────────────────────
@@ -2922,120 +3346,6 @@ register_node(
                 "stabilization; translation/euclidean/affine/feature models, "
                 "first/previous/mean/template anchor; stores per-frame shift (ported "
                 "v1 kernel).")
-
-
-# ── StarDist nuclei segmentation (DL star-convex CNN → Labels, 2D) ─────────────
-
-def _compute_stardist(ctx: EvalContext) -> Dataset:
-    """StarDist star-convex CNN nuclei/cell segmentation (ported v1 ``stardist_segment``
-    kernel) → a Voxel **Label** raster + a per-nucleus Label table. 2D per ``(m,t,z,c)``
-    plane; a pretrained model (default ``2D_versatile_fluo``) is loaded once and reused.
-    Percentile-normalizes each plane, runs ``predict_instances`` (prob/nms thresholds),
-    and area-filters (µm²→px²). Ids are global-unique across planes.
-
-    Deps present in this env (tensorflow/stardist/csbdeep, lazily imported); a missing
-    model raises a clear ImportError. Kernel: :func:`nodegraph.kernels.stardist_segment`."""
-    from scipy import ndimage as ndi
-    from nodegraph.kernels.stardist_segment import get_stardist_model, segment_frame
-    ds = ctx.inputs[0]
-    prov = ds.image
-    if prov is None:
-        raise ValueError("StarDist needs an image provider on its input Dataset")
-    ax = prov.axes
-    model_name = str(ctx.params.get("model_name") or "2D_versatile_fluo")
-    prob = ctx.params.get("prob_thresh")
-    prob = float(prob) if prob not in (None, "") else 0.5
-    nms = float(ctx.params.get("nms_thresh", 0.3))
-    scale = ctx.params.get("scale")
-    scale = float(scale) if scale not in (None, "") else None
-    px = ctx.calib("pixel_size_um") or 0.1
-    min_area = int(round(float(ctx.params.get("min_area", 0.0)) / (px * px)))
-    max_area = int(round(float(ctx.params.get("max_area", 0.0)) / (px * px)))
-    # `disable_gpu` CANNOT be a graph param, which is why it never got a socket and must
-    # not get one now: `get_stardist_model` is a process singleton that returns the
-    # cached model and ignores this flag on every call after the first, and the kernel
-    # must clear CUDA_VISIBLE_DEVICES *before* the first TF import. As a socket it would
-    # be a live control that silently stops working after one pull, and whose effect
-    # depended on process history — which would also make the memo non-deterministic
-    # (identical recipe hash, different device). It is an environment knob, so it reads
-    # from the environment, following the NODELAB_GL precedent (nodelab_v2/app.py:15).
-    import os as _os
-    _cpu = _os.environ.get("NODELAB_STARDIST_CPU", "") in ("1", "true", "yes")
-    try:
-        model = get_stardist_model(model_name, disable_gpu=_cpu)
-    except Exception as exc:  # noqa: BLE001 — surface as a clear catalog error
-        raise ImportError(f"StarDist model {model_name!r} unavailable "
-                          f"(tensorflow/stardist/csbdeep + weights): {exc}") from exc
-    layer = ctx.layer("name")
-    labels6 = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=np.int64)
-    tables = []
-    offset = 0
-    for m, t, z, c in _each_plane_p(ctx, ax, "StarDist"):
-        plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x).astype(np.float32)
-        lab2d = np.asarray(segment_frame(plane, model=model, prob_thresh=prob,
-                                         nms_thresh=nms, scale=scale)[0], dtype=np.int64)
-        ids = np.unique(lab2d)
-        ids = ids[ids > 0]
-        if len(ids):
-            # all object areas in ONE O(pixels) bincount pass (not a full-frame scan
-            # per object — that is O(n_objects·pixels), tens of seconds on a 4096²
-            # frame with thousands of nuclei; review 2026-07-23).
-            areas = np.bincount(lab2d.ravel())[ids]
-            keep = np.ones(len(ids), dtype=bool)
-            if min_area > 0:
-                keep &= areas >= min_area
-            if max_area > 0:
-                keep &= areas <= max_area
-            ids, areas = ids[keep], areas[keep]
-        k = len(ids)
-        if not k:
-            continue
-        remap = np.zeros(int(lab2d.max()) + 1, dtype=np.int64)
-        remap[ids] = np.arange(1, k + 1, dtype=np.int64) + offset
-        labels6[m, t, z, c] = remap[lab2d]
-        cms = ndi.center_of_mass(np.ones_like(lab2d), lab2d, list(map(int, ids)))
-        tables.append(StructureTable(Domain.LABEL, {
-            "id": np.arange(1, k + 1, dtype=np.int64) + offset,
-            "m": np.full(k, m, dtype=np.int64),
-            "t": np.full(k, t, dtype=np.int64),
-            "c": np.full(k, c, dtype=np.int64),
-            "z": np.full(k, z, dtype=float),
-            "y": np.array([p[0] for p in cms], dtype=float),
-            "x": np.array([p[1] for p in cms], dtype=float),
-            "area": areas.astype(np.int64),
-        }, layer=layer, z_kind="plane_index"))
-        offset += k
-    out = ds.with_layer(Domain.VOXEL, layer, labels6)
-    if tables:
-        cols = {kk: np.concatenate([tb.columns[kk] for tb in tables])
-                for kk in tables[0].columns}
-        out = out.with_structure(StructureTable(Domain.LABEL, cols, layer=layer,
-                                                z_kind="plane_index"))
-    return out
-
-
-register_node(
-    _compute_stardist, op_key="detect.stardist_nuclei", label="StarDist Segmentation",
-    reads_domains=frozenset({Domain.VOXEL}),
-    # emits a label RASTER as well as the table — matching analysis.label / watershed
-    adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),
-    category="analysis",
-    inputs=[
-        InDataset(),
-        InFloat("prob_thresh", "Prob threshold", unit="", field=True, default=0.5),
-        InFloat("nms_thresh", "NMS threshold", unit="", field=True, default=0.3),
-        InFloat("scale", "Scale", unit="", field=False),
-        InFloat("min_area", "Min area", unit="um2", field=True, default=0.0),
-        InFloat("max_area", "Max area", unit="um2", field=True, default=0.0),
-        InString("model_name", "Model", field=False, default="2D_versatile_fluo"),
-        InString("name", "Output layer", field=False, default="nuclei",
-                 layer_out=(Domain.VOXEL, Domain.LABEL)),
-    ],
-    outputs=[OutDataset()],
-    granularity=Granularity.WHOLE_PLANE, kernel_axes=frozenset({"y", "x"}),
-    description="StarDist star-convex CNN nuclei/cell segmentation (2D per-plane) → "
-                "Label raster + region table; pretrained model, area filter (µm²→px²) "
-                "(ported v1 kernel; tensorflow/stardist).")
 
 
 # ── Boundary bands (Voxel label raster → outward band raster, 3D) ──────────────

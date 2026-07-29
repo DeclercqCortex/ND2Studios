@@ -1153,15 +1153,30 @@ def main(argv) -> int:
     pdoc.meta_seeds["PS"] = MetaEnvelope(axes=AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16))
     pdoc.add_node("analysis.threshold", node_id="PT", params={"name": "m2"})
     pdoc.add_node("analysis.label", node_id="PL", params={"name": "regions"})
-    pdoc.add_node("analysis.watershed", node_id="PW")
+    # V2.12: `analysis.watershed` is now the `watershed` METHOD of analysis.segment, and
+    # its `mask` socket is gated on that method — so the mode must be set for the picker to
+    # exist at all, which is itself the check that `available_in` gating reaches the form.
+    pdoc.add_node("analysis.segment", node_id="PW", modes={"method": "watershed"})
     pdoc.connect("PS", "image", "PT", "data")
     pdoc.connect("PT", "out", "PL", "data")
     pdoc.connect("PL", "out", "PW", "data")
 
     assert pdoc.layer_choices("PW", pdoc.nodes["PW"].spec().input("mask")) \
         == ["m2", "regions"], "picker must offer the upstream Voxel layers"
-    assert "watershed" not in pdoc.layer_choices(
+    assert "labels" not in pdoc.layer_choices(
         "PW", pdoc.nodes["PW"].spec().input("mask")), "never offer a node its own output"
+    # the method gates BOTH halves of the form: the `mask` socket and the `level` Mode
+    _prec, _pspec = pdoc.nodes["PW"], pdoc.nodes["PW"].spec()
+    _sock_names = lambda: {s.name for s in pdoc.input_specs("PW")}
+    _mode_names = lambda: {m.name for m in _pspec.active_modes(_prec.state())}
+    assert "mask" in _sock_names() and "level" in _mode_names()
+    _prec.modes["method"] = "cellsam"
+    assert "mask" not in _sock_names(), \
+        "a socket the chosen method never reads must vanish from the form"
+    assert "level" not in _mode_names(), \
+        "and so must a MODE the chosen method never reads (V2.12 ModeSpec.available_in)"
+    _prec.modes["method"] = "watershed"
+    assert "mask" in _sock_names() and "level" in _mode_names(), "gating is reversible"
 
     pinsp = _PInsp()
     pitem = _PItem(pdoc.nodes["PW"], pdoc)
@@ -1169,7 +1184,9 @@ def main(argv) -> int:
     _pick = next((c for c in pinsp.findChildren(_NoWheelCombo) if c.isEditable()
                   and [c.itemText(i) for i in range(c.count())] == ["m2", "regions"]), None)
     assert _pick is not None, "no populated layer picker in the inspector"
-    assert _pick.currentText() == "mask", "picker starts at the socket default"
+    # The Segmentation node's foreground socket defaults to EMPTY — unset means "segment
+    # the image", and naming a layer means "split THAT foreground instead".
+    assert _pick.currentText() == "", "picker starts at the socket default"
     _pick.setCurrentText("regions")
     _pick.activated.emit(_pick.findText("regions"))
     assert pdoc.nodes["PW"].params.get("mask") == "regions", "picking commits"

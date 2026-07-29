@@ -1,9 +1,12 @@
 # `pure_analysis/` — portable analysis math-kernels
 
-Fourteen self-contained analysis **math-kernels** vendored (byte-verbatim) out of
-the ND2Studios app (branch `Version-1.45`) so they can be ported into a *different*
+Fifteen self-contained analysis **math-kernels**. Fourteen were vendored (byte-verbatim)
+out of the ND2Studios app (branch `Version-1.45`) so they can be ported into a *different*
 software's new node system without dragging along the ND2Studios GUI, its plugin
-registry, or its pipeline runtime.
+registry, or its pipeline runtime; the fifteenth (`cellsam_segment`, V2.12) is a new
+adapter of the same shape around a third-party package that has no v1 counterpart.
+(`mesh_raster.py`, V2.08, is new in-repo code rather than a kernel of this kind and is
+deliberately not indexed here — its contract lives in its module docstring.)
 
 Each kernel is a `<module>.py` + `<module>.md` pair:
 
@@ -58,7 +61,8 @@ it returns a numpy result. That is the whole contract.
 | [`granule_boundary`](granule_boundary.md) | Granule Boundary Extraction | `extract_boundary_bands(masks_by_id, combined_labels_zhw, voxel_size_um, params)` | in-repo | numpy, scipy |
 | [`dic_mesh_region`](dic_mesh_region.md) | DIC Mesh Region | `build_roi_mask(shapes, H, W)` (+ `has_region`) | in-repo (skimage.draw) | numpy, scikit-image |
 | [`dic_mesh_refinement`](dic_mesh_refinement.md) | DIC Mesh Refinement | `build_roi_mask(...)`, `_refinement_policy(refinement, half_win)` | mask in-repo / refinement policy **external** | numpy, scikit-image, al-dic* |
-| [`stardist_segment`](stardist_segment.md) | StarDist Segmentation | `segment_frame(image, ...)` (+ `get_stardist_model`, `filter_and_relabel`) | **external** (stardist CNN + NMS) | numpy, tensorflow*, stardist*, csbdeep* |
+| [`stardist_segment`](stardist_segment.md) | Segmentation (method=stardist) | `segment_frame(image, ...)` (+ `get_stardist_model`, `filter_and_relabel`) | **external** (stardist CNN + NMS) | numpy, tensorflow*, stardist*, csbdeep* |
+| [`cellsam_segment`](cellsam_segment.md) | Segmentation (method=cellsam) | `segment_plane(image, ...)` (+ `get_cellsam_model`, `relabel_contiguous`, `cellsam_available`) | **external** (SAM ViT + CellFinder Anchor-DETR) | numpy, cellSAM*, torch*, dask-image* |
 | [`dic_correlate`](dic_correlate.md) | DIC (pyALDIC) | `run_pyaldic_pair(...)`, `run_pyaldic_series(...)` | **external** (al-dic IC-GN + ADMM) | numpy, scipy, scikit-image, al-dic* |
 | [`checkpoint`](checkpoint.md) | Checkpoint | `save_checkpoints(...)`, `load_checkpoints(...)`, `checkpoints_dir_for(...)` | **none — serialization only** | numpy |
 
@@ -157,6 +161,9 @@ is defined by the external package's version:
     griddata-resample + axis-swap output adapter.
   - `dic_mesh_refinement`'s `_refinement_policy` → `al-dic` (`build_refinement_policy`);
     returns `None` (fail-soft) when al-dic is absent. Its `build_roi_mask` half is in-repo.
+  - `cellsam_segment` → `cellSAM` + `segment_anything` + `torch` (a SAM ViT-B decoder
+    prompted by CellFinder box detections). The in-repo glue is the model singleton, the
+    device knob, four upstream-quirk normalizations and a contiguous relabel.
 - **Pure in-repo math** (native ND2Studios code; installs are just numpy/scipy-class):
   `histogram_threshold`, `aldvc_field` (a clean-room numpy/scipy port of FranckLab ALDVC —
   *not* the same thing as the `al-dic`-backed `dic_correlate`), `track_objects`,
@@ -172,7 +179,9 @@ call path that needs them raises (a friendly `ImportError`, usually `find_spec`-
 Others are **import-time** — the module will not even import without them. This changes what
 you must install just to load a kernel. See the matrix; the headline cases:
 
-- **Lazy / optional**: `tensorflow`/`stardist`/`csbdeep` (stardist_segment), `al-dic`
+- **Lazy / optional**: `cellSAM`/`torch` (cellsam_segment — `find_spec`-gated, and
+  `resolve_device("cpu")` avoids the torch import entirely),
+  `tensorflow`/`stardist`/`csbdeep` (stardist_segment), `al-dic`
   (dic_correlate, dic_mesh_refinement), `cupy` (aldvc_field — GPU FFT seed only, CPU
   fallback), `scikit-learn` (granule_cluster; track_objects warm-start).
 - **Import-time (must be installed to `import`)**: `numpy` (all), `scipy` +
@@ -202,6 +211,7 @@ degrades gracefully / falls back if absent). Blank = not used.
 | dic_mesh_region | IT | | L | | | | | | | | | |
 | dic_mesh_refinement | IT | | L | | | | | | | | | L·opt |
 | stardist_segment | IT | | | | | | | L | L | L | | |
+| cellsam_segment | IT | | | | | | L·opt | | | | | |
 | dic_correlate | IT | L | L | | | | | | | | | L·opt |
 | checkpoint | IT | | | | | | | | | | | |
 
@@ -246,6 +256,7 @@ Each kernel was smoke-tested: `import` check plus a synthetic call where all dep
 | dic_mesh_region | ok | ran | rect + circle-cut → `(10,10)` bool mask |
 | dic_mesh_refinement | ok | **partial** | mask paths ran; `_refinement_policy` → `None` (al-dic absent, correct fail-soft) |
 | stardist_segment | ok | ran | 64×64 two-blob frame end-to-end (TF/stardist/csbdeep present) |
+| cellsam_segment | ok | **partial** | glue ran against a stubbed `cellSAM` (singleton reuse, kwarg forwarding, the `(3,H,W)` no-cells quirk, contiguous relabel); the real SAM+CellFinder net **not run** (package not installed, weights need a DeepCell token) |
 | dic_correlate | ok | **partial** | in-repo adapters ran (axis swap verified); external al-dic solver **not run** (not installed) |
 | checkpoint | ok | ran | save/load round-trip; store rebuild verified |
 

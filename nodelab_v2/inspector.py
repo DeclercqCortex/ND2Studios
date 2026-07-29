@@ -14,8 +14,8 @@ from typing import Optional
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QScrollArea, QSpinBox,
-    QToolButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QScrollArea,
+    QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 from nodegraph.sockets import SocketType
@@ -288,8 +288,9 @@ class InspectorPanel(QScrollArea):
             self._v.addWidget(sec)
             self._v.addWidget(self._sep())
 
-        # in-body modes (non-dim)
-        modes = [m for m in spec.modes if not m.is_dim_lever]
+        # in-body modes (non-dim), mode-gated like the sockets above: a Mode the selected
+        # method never reads is hidden, not shown and ignored (V2.12 `ModeSpec.available_in`)
+        modes = [m for m in spec.active_modes(node.state()) if not m.is_dim_lever]
         if modes:
             sec = self._section("Mode")
             for m in modes:
@@ -316,6 +317,17 @@ class InspectorPanel(QScrollArea):
         pinned = s.name in node.params or s.name in node.locked
         auto = derived and not pinned
 
+        if s.type is SocketType.BOOL:
+            # A flag is a checkbox, not a 0.000 / 1.000 spin box. Without this branch BOOL
+            # fell through to the float editor below, so every toggle in the catalog read
+            # as a mysterious decimal ("normalize 1.000"). The value is committed as a real
+            # `bool` because the computes read it through `bool(ctx.params.get(...))` and
+            # the param is serialized as-is.
+            chk = QCheckBox()
+            chk.setChecked(bool(node.params.get(s.name, s.default)))
+            chk.toggled.connect(lambda v, nm=s.name: self._set_param(node, nm, bool(v)))
+            lay.addWidget(chk)
+            return row
         if s.type is SocketType.INT:
             box = QSpinBox(); box.setRange(0, 100000)
             box.setValue(int(node.params.get(s.name, s.default if s.default is not None else 0)))

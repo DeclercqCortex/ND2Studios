@@ -274,7 +274,7 @@ TAB_INFO: Tuple[TabInfo, ...] = (
             "detect.particles, DVC/DIC field samples)."),
     TabInfo("labels", "Labels", True,
             "Integer label rasters — the Voxel-domain label layer with the most "
-            "regions on the viewed plane (structure.label_components, watershed)."),
+            "regions on the viewed plane (analysis.segment, analysis.label)."),
     TabInfo("tracks", "Tracks", True,
             "Track-domain trajectories: member positions joined across time "
             "(track.link, track.objects)."),

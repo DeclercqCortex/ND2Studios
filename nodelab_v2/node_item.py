@@ -348,6 +348,12 @@ class NodeItem(QGraphicsObject):
         # channel (the document owns the resolution + the channel descriptors).
         return self.doc.output_specs(self.rec.id)
 
+    def _active_modes(self):
+        """The Modes this instance shows — gated on the current mode state, so a Mode the
+        selected method never reads is absent from the card as well as the inspector
+        (V2.12 ``ModeSpec.available_in``)."""
+        return self.spec.active_modes(self.rec.state()) if self.spec else ()
+
     # ── per-channel outputs (chK) ─────────────────────────────────────────────
     @staticmethod
     def output_channel_index(socket_name: str) -> Optional[int]:
@@ -466,7 +472,7 @@ class NodeItem(QGraphicsObject):
             self._sockets[("in", s.name)] = sock
             self._rows.append(("in", s, y))
             y += T.ROW_H
-        for m in (self.spec.modes if self.spec else ()):
+        for m in self._active_modes():
             if m.is_dim_lever:
                 continue
             self._rows.append(("mode", m, y))
@@ -527,10 +533,14 @@ class NodeItem(QGraphicsObject):
     def refresh(self) -> None:
         """Re-read model state (envelope/derives/mute/guards) — cheap, no relayout
         unless the active socket set OR the collapsed state changed."""
+        # the active MODE list is part of the layout too (V2.12): a method switch that
+        # gates a Mode away without changing any socket name must still relayout.
         want = ([s.name for s in self._active_inputs()],
-                [s.name for s in self._active_outputs()])
+                [s.name for s in self._active_outputs()],
+                [m.name for m in self._active_modes() if not m.is_dim_lever])
         have = ([k[1] for k in self._sockets if k[0] == "in"],
-                [k[1] for k in self._sockets if k[0] == "out"])
+                [k[1] for k in self._sockets if k[0] == "out"],
+                [r[1].name for r in self._rows if r[0] == "mode"])
         collapse_changed = getattr(self, "_shown_collapsed", None) != self.rec.collapsed
         if want != have or collapse_changed:
             self._shown_collapsed = self.rec.collapsed

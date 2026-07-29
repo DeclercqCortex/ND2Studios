@@ -53,7 +53,10 @@ looking up facts in the repo yourself). Walk this decision tree in dependency or
    non-dim `Mode`, gate every param only one branch reads** — `available_in` keys on any
    mode name, and a socket the chosen method never consumes must be hidden, not accepted
    and discarded (`wire-node-v2` §5b; check the kernel per branch, and leave ungated
-   anything live in all branches or whose liveness depends on a wire).
+   anything live in all branches or whose liveness depends on a wire). **A second MODE that
+   only some branches read is gated the same way** (`ModeSpec.available_in`,
+   `wire-node-v2` §5c) — a Mode may not gate on itself, and gating never substitutes for a
+   refusal when the compute still resolves the value (the dim lever).
 5. **Footprint.** `Granularity` per dim (TILEABLE / WHOLE_PLANE / WHOLE_VOLUME /
    WHOLE_SERIES / MULTI_VIEW) + `kernel_axes`. Must match what the compute reads.
 6. **Backend.** Which scipy/skimage (or other) call? **Re-verify it exists + its

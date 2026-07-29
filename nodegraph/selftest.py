@@ -1501,8 +1501,10 @@ def test_catalog_ported2() -> None:
         dist = eng("analysis.edt", modes={"dim": dim}, chain=(thr,)).pull("N").get(D.VOXEL, "distance")
         assert dist is not None and np.all(np.isfinite(dist.values)) and dist.values.max() > 0
 
-    # Watershed: global-unique Label raster + region table
-    w = eng("analysis.watershed", modes={"dim": "2D"}, chain=(thr,)).pull("N")
+    # Segmentation, watershed method (V2.12 - `analysis.watershed` folded in here):
+    # a global-unique Label raster + region table, splitting the mask it is pointed at
+    w = eng("analysis.segment", modes={"dim": "2D", "method": "watershed"},
+            params={"mask": "mask", "name": "watershed"}, chain=(thr,)).pull("N")
     assert int(w.get(D.VOXEL, "watershed").values.max()) >= 1
     warea = w.get(D.LABEL, "area", layer="watershed")
     assert warea is not None and len(set(range(1, len(warea.values) + 1)))  # ids present
@@ -1552,11 +1554,11 @@ def test_catalog_ported2() -> None:
                             {"threshold": 20.0, "name": "m2"}),)).pull("N")
     assert lab_named.get(D.VOXEL, "regions2") is not None, "label `mask`+`name` sockets"
     assert lab_named.get(D.LABEL, "area", layer="regions2") is not None, "label table follows"
-    wat_named = eng("analysis.watershed", modes={"dim": "2D"},
+    wat_named = eng("analysis.segment", modes={"dim": "2D", "method": "watershed"},
                     params={"mask": "m2", "name": "ws2"},
                     chain=(("analysis.threshold", None,
                             {"threshold": 20.0, "name": "m2"}),)).pull("N")
-    assert wat_named.get(D.VOXEL, "ws2") is not None, "watershed `mask`+`name` sockets"
+    assert wat_named.get(D.VOXEL, "ws2") is not None, "segment `mask`+`name` sockets"
     # pointing a node at a layer that does not exist must RAISE, not silently no-op
     try:
         eng("analysis.label", modes={"dim": "2D"}, params={"mask": "nope"},
@@ -4599,6 +4601,492 @@ def test_engine_observer() -> None:
 
 
 
+# ── V2.12: the central Segmentation node (one contract, the algorithm as a Mode) ──
+
+def _stub_cellsam(planes, *, nocells="", log=None):
+    """A fake ``cellSAM`` package, injected into ``sys.modules`` so the kernel's GLUE is
+    covered in the fast gate — the real model is a multi-hundred-MB download behind a
+    DeepCell API token, so it can never run here, and the glue is where the integration
+    risk lives (the mis-shaped no-cells return, the model singleton, kwarg forwarding, the
+    contiguous relabel). ``find_spec`` resolves through ``sys.modules``, which is why the
+    stub carries a ``__spec__``; ``planes`` records every call so the test can prove the
+    checkpoint is read once per pull rather than once per plane."""
+    import sys
+    import types
+    from importlib.machinery import ModuleSpec
+    mod = types.ModuleType("cellSAM")
+    mod.__spec__ = ModuleSpec("cellSAM", None)
+
+    class _Net:                      # torch is never imported: no .parameters() needed
+        def eval(self):
+            return self
+
+        def to(self, dev):
+            return self
+
+    def get_model(model="cellsam_general", version=None):
+        planes.append(("load", model))
+        return _Net()
+
+    def get_local_model(path):
+        planes.append(("local", str(path)))
+        return _Net()
+
+    def segment_cellular_image(img, model, **kw):
+        h, w = np.shape(img)
+        planes.append(("seg", float(kw["bbox_threshold"]), bool(kw["normalize"])))
+        if nocells == "attr":
+            # The REAL no-cells failure (upstream issue #98): `CellSAM.predict` returns the
+            # 4-tuple (None,)*4, so `if preds is None` never fires and upstream calls
+            # `fill_holes_and_remove_small_masks(None)`. This is what a blank plane, an
+            # empty FOV or the dark end slices of a stack actually hit.
+            raise AttributeError("'NoneType' object has no attribute 'ndim'")
+        if nocells == "shape":
+            # Upstream's own (unreachable) empty branch: `np.zeros(img.shape[1:])` on the
+            # (1,3,H,W) TENSOR. Covered so an upstream fix for #98 lands safely.
+            return np.zeros((3, h, w), dtype=np.int32), None, None
+        lab = np.zeros((h, w), dtype=np.int32)
+        lab[1:5, 1:5] = 9                        # ids deliberately non-contiguous
+        lab[2, 2] = 0                            # an interior hole
+        lab[7:9, 7:9] = 4                        # a 4-px object (for the size filter)
+        return lab, None, None
+
+    mod.get_model, mod.get_local_model = get_model, get_local_model
+    mod.segment_cellular_image = segment_cellular_image
+    if log is not None:
+        wsi = types.ModuleType("cellSAM.wsi")
+        wsi.__spec__ = ModuleSpec("cellSAM.wsi", None)
+
+        def segment_wsi(image, block, overlap, iou_depth, iou_threshold, **kw):
+            log.append((int(block), int(overlap), int(iou_depth), float(iou_threshold)))
+            return segment_cellular_image(image, kw.get("model"),
+                                          **{k: v for k, v in kw.items() if k != "model"})[0]
+        wsi.segment_wsi = segment_wsi
+        mod.wsi = wsi
+        sys.modules["cellSAM.wsi"] = wsi
+    sys.modules["cellSAM"] = mod
+    return mod
+
+
+def test_segment() -> None:
+    """``analysis.segment`` — THE segmentation node (V2.12). Every segmentation has the
+    same data contract (image in; a Voxel label raster + a Label table out), so the
+    algorithm is a ``method`` Mode instead of a node type: ``analysis.watershed`` and
+    ``detect.stardist_nuclei`` were folded in and deleted, and CellSAM joined.
+
+    Covers the structural spec (per-method socket gating, the new Mode-level gating, the
+    per-dim footprint), a real end-to-end pull of both dependency-free methods in 2D and
+    3D, the property that actually distinguishes them (watershed splits a touching pair
+    that connected components merges), every shared stage (hole filling, the µm²/µm³ size
+    filter, globally-unique ids, the region table), the memo fences, every hard refusal,
+    and the CellSAM glue against a stubbed package."""
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+
+    # ── structural spec (no image deps needed) ─────────────────────────────────
+    s = NODES.get("analysis.segment")
+    assert s.category == "analysis" and s.label == "Segmentation"
+    assert s.reads_domains == frozenset({D.VOXEL})
+    assert s.adds_domains == frozenset({D.VOXEL, D.LABEL})   # a raster AND a table
+    assert s.meta_transform is None                          # never changes axes/calib
+    assert s.resolve_granularity({"dim": "2D"}) is Granularity.WHOLE_PLANE
+    assert s.resolve_granularity({"dim": "3D"}) is Granularity.WHOLE_VOLUME
+    assert s.resolve_kernel_axes({"dim": "3D"}) == frozenset({"z", "y", "x"})
+    assert all(not i.is_field for i in s.inputs if i.type is not SocketType.DATASET), \
+        "no path in this node evaluates a wired Field — field=True would be a lie"
+    mode_of = {m.name: m for m in s.modes}
+    assert set(mode_of) == {"dim", "method", "level"}
+    assert set(mode_of["method"].choices) == {"threshold", "watershed", "stardist",
+                                              "cellsam"}
+    assert mode_of["method"].resolved_default() == "threshold", \
+        "the dependency-free method must be the default — a fresh node has to just run"
+    assert mode_of["level"].resolved_default() == "otsu"
+    # method-gated sockets: each method sees ONLY its own controls
+    vis = lambda st: {i.name for i in s.active_inputs(st)}
+    st2 = {"dim": "2D", "method": "threshold", "level": "otsu"}
+    assert "connectivity" in vis(st2) and "mask" not in vis(st2)
+    assert "mask" in vis({**st2, "method": "watershed"})
+    assert "min_distance" in vis({**st2, "method": "watershed"})
+    assert "connectivity" not in vis({**st2, "method": "watershed"}), \
+        "watershed takes its regions from the markers, never from a connectivity"
+    assert "prob_thresh" in vis({**st2, "method": "stardist"})
+    assert "bbox_threshold" in vis({**st2, "method": "cellsam"})
+    assert not (vis({**st2, "method": "stardist"}) & {"bbox_threshold", "cellsam_model"})
+    assert not (vis({**st2, "method": "cellsam"}) & {"prob_thresh", "model_name"}), \
+        "socket names must stay DISJOINT across methods — the card relayouts on the name " \
+        "list, so a same-named socket with another default would not redraw"
+    # the fixed level only exists under level=fixed, and only for the cutting methods
+    assert "threshold" in vis({**st2, "level": "fixed"})
+    assert "threshold" not in vis(st2)
+    assert "threshold" not in vis({**st2, "method": "cellsam", "level": "fixed"})
+    # a 2D object has an area, a 3D object a volume — never one socket meaning both
+    assert {"min_area", "max_area"} <= vis(st2) and "min_volume" not in vis(st2)
+    assert "min_volume" in vis({**st2, "dim": "3D"}) and "max_area" not in \
+        vis({**st2, "dim": "3D"})
+    # ── V2.12 Mode gating: `level` is meaningless to a learned detector, so the whole
+    #    dropdown is hidden rather than shown and ignored (ModeSpec.available_in)
+    amodes = lambda st: {m.name for m in s.active_modes(st)}
+    assert amodes(st2) == {"dim", "method", "level"}
+    assert amodes({**st2, "method": "watershed"}) == {"dim", "method", "level"}
+    assert amodes({**st2, "method": "cellsam"}) == {"dim", "method"}
+    assert amodes({**st2, "method": "stardist"}) == {"dim", "method"}
+    # ...and a hidden Mode still carries its value, so the compute and the memo are
+    # unaffected by what the GUI draws (the same rule as a hidden socket)
+    assert s.default_state()["level"] == "otsu"
+
+    if not _HAVE_WATERSHED:
+        _ok("segmentation: spec OK; RUN SKIPPED (scipy/skimage absent)")
+        return
+
+    # ── fixture: two separated disks, one TOUCHING pair, and a hole ────────────
+    def _disk(a, cy, cx, r, val):
+        yy, xx = np.mgrid[0:a.shape[0], 0:a.shape[1]]
+        a[(yy - cy) ** 2 + (xx - cx) ** 2 <= r * r] = val
+
+    Y = X = 32
+    plane = np.zeros((Y, X), dtype=float)
+    _disk(plane, 7, 7, 4, 100.0)                     # A — 44 px after its hole
+    _disk(plane, 7, 24, 4, 100.0)                    # B — 49 px
+    _disk(plane, 22, 10, 5, 100.0)                   # C \ overlapping: ONE component
+    _disk(plane, 22, 18, 5, 100.0)                   # D / that only a watershed splits
+    _hole = np.zeros((Y, X), dtype=bool)
+    _disk(_hole, 7, 7, 1, True)
+    plane[_hole] = 0.0                               # 5-px hole in the middle of A
+    ax = AxisSizes(m=1, t=1, z=3, c=1, y=Y, x=X)
+    img = np.zeros((1, 1, 3, 1, Y, X), dtype=float)
+    img[0, 0, :, 0] = plane                          # identical on all 3 planes
+    optics = {"pixel_size_um": 0.5, "z_step_um": 1.0, "bit_depth": 12}
+    seedenv = MetaEnvelope(axes=ax, metadata=optics)
+    ds = Dataset(axes=ax, metadata=dict(optics)).with_image(ArrayProvider(img))
+    define_node("io.segseed", "Seed", outputs=[OutDataset()])
+
+    def eng(*, modes=None, params=None, chain=(), dset=None, denv=None):
+        g = Graph(); g.add(NodeInstance("S", "io.segseed")); prev = "S"
+        for i, (cop, cmodes, cparams) in enumerate(chain):
+            nid = f"U{i}"
+            g.add(NodeInstance(nid, cop, modes=cmodes or {}, params=cparams or {}))
+            g.connect(prev, nid); prev = nid
+        g.add(NodeInstance("N", "analysis.segment", modes=modes or {},
+                           params=params or {}))
+        g.connect(prev, "N")
+        return Engine(g, computes=COMPUTES, seeds={"S": dset if dset is not None else ds},
+                      meta_seeds={"S": denv if denv is not None else seedenv})
+
+    def seg(**kw):
+        """(engine, raster, {column: values}) for one pull, output layer 'labels'."""
+        e = eng(**kw)
+        out = e.pull("N")
+        raster = out.get(D.VOXEL, "labels")
+        assert raster is not None, "no Voxel label raster"
+        cols = {c: (out.get(D.LABEL, c, layer="labels").values
+                    if out.get(D.LABEL, c, layer="labels") is not None else None)
+                for c in ("id", "area", "z", "y", "x", "m", "t", "c")}
+        return e, out, np.asarray(raster.values), cols
+
+    # ── the two dependency-free methods, 2D and 3D ────────────────────────────
+    e2, out2, r2, c2 = seg(modes={"dim": "2D", "method": "threshold"})
+    assert int(r2.max()) == 9, "3 planes x 3 connected regions (the pair is ONE region)"
+    assert len(c2["id"]) == 9 and sorted(c2["id"].tolist()) == list(range(1, 10)), \
+        "ids must be globally unique and contiguous across every unit"
+    assert sorted(np.unique(r2[r2 > 0]).tolist()) == c2["id"].tolist(), \
+        "the raster's ids ARE the table's ids"
+    assert sorted(c2["area"].tolist()) == [44, 44, 44, 49, 49, 49, 153, 153, 153], \
+        "area is a voxel count, per plane"
+    assert sorted(set(c2["z"].tolist())) == [0.0, 1.0, 2.0], "2D z = the plane index"
+    assert out2.structure_zkind(D.LABEL, "labels") == "plane_index"
+    # the viewer's Labels overlay discovers a raster by DTYPE + rank, not by name
+    assert np.issubdtype(r2.dtype, np.integer) and r2.ndim == 6, \
+        "the overlay only draws an integer 6-D Voxel layer"
+
+    e3, out3, r3, c3 = seg(modes={"dim": "3D", "method": "threshold"})
+    assert int(r3.max()) == 3, "3D labels the VOLUME: the 3 regions are z-connected"
+    assert sorted(c3["area"].tolist()) == [132, 147, 459], "3x the per-plane areas"
+    assert out3.structure_zkind(D.LABEL, "labels") == "subpixel"
+    assert all(0.0 <= z <= 2.0 for z in c3["z"].tolist()), "3D z = a centroid, in range"
+
+    # THE property that distinguishes the two classical methods: the touching pair is one
+    # connected component and four disks, so only the watershed recovers the fourth object.
+    _, _, rw, cw = seg(modes={"dim": "2D", "method": "watershed"},
+                       params={"min_distance": 1.5})
+    assert int(rw.max()) == 12, "watershed splits the pair: 3 planes x 4 objects"
+    assert sorted(cw["area"].tolist())[:4] == [44, 44, 44, 49]
+    _, _, rw3, cw3 = seg(modes={"dim": "3D", "method": "watershed"},
+                         params={"min_distance": 1.5})
+    assert int(rw3.max()) == 4, "volumetric watershed: 4 z-connected objects"
+    # REGRESSION (V2.12): the folded-in `analysis.watershed` numbered EVERY peak pixel
+    # returned by peak_local_max as its own marker, so an EDT plateau — the diagonal crest
+    # inside the holed disk here — shattered one object into one basin per plateau pixel
+    # (this fixture: 11 per plane, some of them 1 voxel). Merging the plateau with FULL
+    # connectivity is the fix; these counts are its guard.
+    assert int(rw.max()) < 15 and int(cw["area"].min()) > 5, \
+        "EDT plateaus must merge into ONE marker, not one marker per plateau pixel"
+    # REGRESSION (V2.12): `peak_local_max` excludes a border shell `min_distance` wide on
+    # EVERY axis by default — and `min_distance` is a parameter this call does not even use
+    # (the physical suppression is the per-axis footprint). With the default left on, a
+    # 3D volume of z<=2 has NO interior z plane, so ZERO peaks come back, the single-marker
+    # fallback fires, and every object in the volume collapses into one. Two disjoint disks
+    # over a 2-plane stack returned 1 object instead of 2. An object against the frame edge
+    # was dropped for the same reason.
+    thin = np.zeros((1, 1, 2, 1, Y, X), dtype=float)
+    thin[0, 0, :, 0] = plane
+    thin[0, 0, :, 0, 0:4, 0:4] = 100.0                # a 5th object in the frame CORNER
+    thin_ax = AxisSizes(m=1, t=1, z=2, c=1, y=Y, x=X)
+    thin_ds = Dataset(axes=thin_ax, metadata=dict(optics)).with_image(ArrayProvider(thin))
+    thin_env = MetaEnvelope(axes=thin_ax, metadata=optics)
+    _, _, rthin, _ = seg(modes={"dim": "3D", "method": "watershed"},
+                         params={"min_distance": 1.5}, dset=thin_ds, denv=thin_env)
+    assert int(rthin.max()) == 5, \
+        "a z<=2 volume must still yield every object (border exclusion off), got %d" \
+        % int(rthin.max())
+    _, _, rthin2, _ = seg(modes={"dim": "2D", "method": "watershed"},
+                          params={"min_distance": 1.5}, dset=thin_ds, denv=thin_env)
+    assert int(rthin2.max()) == 10, "2 planes x 5 objects incl. the frame-corner one"
+
+    # ── the shared stages ─────────────────────────────────────────────────────
+    # hole filling closes A's 5-px hole, so A ends up the same size as the intact disk B
+    _, _, _, cf = seg(modes={"dim": "2D", "method": "threshold"},
+                      params={"fill_holes": True})
+    assert sorted(cf["area"].tolist()) == [49] * 6 + [153] * 3, \
+        "fill_holes must close the interior hole (44 -> 49) and touch nothing else"
+    # the size filter is PHYSICAL: 20 µm² / (0.5 µm)² = 80 px², which keeps only the pair
+    _, _, rmin, cmin = seg(modes={"dim": "2D", "method": "threshold"},
+                           params={"min_area": 20.0})
+    assert cmin["area"].tolist() == [153] * 3, "min_area (µm²) -> px² drops the disks"
+    _, _, _, cmax = seg(modes={"dim": "2D", "method": "threshold"},
+                        params={"max_area": 20.0})
+    assert sorted(cmax["area"].tolist()) == [44, 44, 44, 49, 49, 49], "max_area keeps them"
+    # ...and in 3D it is a VOLUME: 40 µm³ / (0.5·0.5·1.0) = 160 voxels
+    _, _, _, cvol = seg(modes={"dim": "3D", "method": "threshold"},
+                        params={"min_volume": 40.0})
+    assert cvol["area"].tolist() == [459], "min_volume (µm³) -> voxels"
+
+    # ── the foreground cut ────────────────────────────────────────────────────
+    for lvl in ("otsu", "li", "yen", "triangle", "mean"):
+        _, _, rl, _ = seg(modes={"dim": "2D", "method": "threshold", "level": lvl})
+        assert int(rl.max()) >= 3, f"level {lvl} found nothing"
+    _, _, rfx, _ = seg(modes={"dim": "2D", "method": "threshold", "level": "fixed"},
+                       params={"threshold": 50.0})
+    assert int(rfx.max()) == 9, "a fixed level in the image's own units"
+    # a flat unit must NOT become one giant object (skimage's methods return the constant)
+    flat = Dataset(axes=ax, metadata=dict(optics)).with_image(
+        ArrayProvider(np.full((1, 1, 3, 1, Y, X), 7.0)))
+    _, _, rflat, _ = seg(modes={"dim": "2D", "method": "threshold"}, dset=flat)
+    assert int(rflat.max()) == 0, "a blank plane segments to nothing, not to one big blob"
+    # ...and a single NON-FINITE voxel must not take the histogram down with it. Untreated,
+    # every skimage method raises "autodetected range ... is not finite", and NaN also
+    # defeats the flat guard above (nan == nan is False). Deconvolution / normalize /
+    # resample can all put one there.
+    for tag, bad in (("nan", np.nan), ("inf", np.inf)):
+        dirty = img.copy(); dirty[0, 0, 0, 0, 0, 0] = bad
+        dds2 = Dataset(axes=ax, metadata=dict(optics)).with_image(ArrayProvider(dirty))
+        _, _, rnf, cnf = seg(modes={"dim": "2D", "method": "threshold"}, dset=dds2)
+        assert int(rnf.max()) == 9, f"one {tag} voxel must not change the segmentation"
+        assert sorted(cnf["area"].tolist())[:3] == [44, 44, 44], \
+            f"one {tag} voxel must not join or split an object"
+    allnan = Dataset(axes=ax, metadata=dict(optics)).with_image(
+        ArrayProvider(np.full((1, 1, 3, 1, Y, X), np.nan)))
+    _, _, rnan, _ = seg(modes={"dim": "2D", "method": "threshold"}, dset=allnan)
+    assert int(rnan.max()) == 0, "an all-NaN plane segments to nothing"
+
+    # connectivity: two corner-touching squares are 2 objects at 4-conn, 1 at 8-conn
+    dax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    dimg = np.zeros((1, 1, 1, 1, 8, 8), dtype=float)
+    dimg[0, 0, 0, 0, 1:3, 1:3] = 50.0
+    dimg[0, 0, 0, 0, 3:5, 3:5] = 50.0                # touches the first only diagonally
+    denv = MetaEnvelope(axes=dax, metadata=optics)
+    dds = Dataset(axes=dax, metadata=dict(optics)).with_image(ArrayProvider(dimg))
+    for conn, want in ((4, 2), (8, 1)):
+        _, _, rc, _ = seg(modes={"dim": "2D", "method": "threshold"},
+                          params={"connectivity": conn}, dset=dds, denv=denv)
+        assert int(rc.max()) == want, f"{conn}-connectivity should give {want} region(s)"
+    # 0 is what a spin box commits when it is touched; it must mean "per-dim default" (8),
+    # not reach `_connectivity_rank` and raise on a value the user never chose
+    _, _, rc0, _ = seg(modes={"dim": "2D", "method": "threshold"},
+                       params={"connectivity": 0}, dset=dds, denv=denv)
+    assert int(rc0.max()) == 1, "connectivity=0 must resolve to the 2D default (8)"
+
+    # ── the watershed `mask` socket: split an EXISTING foreground ──────────────
+    thr = ("analysis.threshold", {"method": "fixed"}, {"threshold": 50.0, "name": "m2"})
+    outm = eng(modes={"dim": "2D", "method": "watershed"},
+               params={"mask": "m2", "name": "ws2", "min_distance": 1.5},
+               chain=(thr,)).pull("N")          # NOT seg(): the output layer is renamed
+    assert outm.get(D.VOXEL, "ws2") is not None, "`mask` + `name` sockets"
+    assert outm.get(D.VOXEL, "labels") is None, "no stale default layer"
+    assert outm.get(D.LABEL, "area", layer="ws2") is not None, "the table follows `name`"
+    assert int(np.asarray(outm.get(D.VOXEL, "ws2").values).max()) == 12, \
+        "splitting the upstream mask must match splitting its own cut"
+
+    # ── memo behaviour ────────────────────────────────────────────────────────
+    reads2 = dict(e2.entry("N").reads)
+    assert "pixel_size_um" in reads2, "the µm² filter must fence on the pixel size"
+    assert "z_step_um" in dict(e3.entry("N").reads), "µm³ needs the z step too"
+    # every (method, dim, level) must memoize distinctly. Keyed WITHOUT pulling — the
+    # engine's `entry()` computes, and asking a hash question must not load a TensorFlow
+    # model or trip the cellsam dependency gate. This mirrors engine._entry exactly:
+    # the mode state folds into params as `__modes__`, then node_recipe_hash.
+    from nodegraph.memo import node_recipe_hash
+    hashes = {}
+    for meth in ("threshold", "watershed", "stardist", "cellsam"):
+        for dim in ("2D", "3D"):
+            for lvl in ("otsu", "li"):
+                st = {"dim": dim, "method": meth, "level": lvl}
+                hashes[(meth, dim, lvl)] = node_recipe_hash(
+                    "analysis.segment", {"__modes__": st}, ("up",), (1,))
+    assert len(set(hashes.values())) == 16, \
+        "method x dim x level must all fold into the recipe hash"
+    # ...and prove it end to end on the two methods that can actually run here
+    assert (eng(modes={"dim": "2D", "method": "threshold"}).entry("N").recipe_hash
+            != eng(modes={"dim": "3D", "method": "threshold"}).entry("N").recipe_hash)
+    assert (eng(modes={"dim": "2D", "method": "threshold"}).entry("N").recipe_hash
+            != eng(modes={"dim": "2D", "method": "watershed"}).entry("N").recipe_hash)
+
+    # ── refusals ──────────────────────────────────────────────────────────────
+    for meth in ("stardist", "cellsam"):
+        try:
+            eng(modes={"dim": "3D", "method": meth}).pull("N")
+            raise AssertionError(f"{meth} must refuse the 3D lever")
+        except ValueError as exc:
+            assert "2-D-per-plane" in str(exc) and "2D" in str(exc), \
+                "the refusal has to name the fix"
+    try:
+        eng(modes={"dim": "2D", "method": "watershed"},
+            params={"mask": "nope"}).pull("N")
+        raise AssertionError("a named foreground layer that does not exist must raise")
+    except ValueError as exc:
+        assert "nope" in str(exc)
+    for bad, key in (({"method": "bogus"}, "method"), ({"level": "bogus"}, "level")):
+        try:
+            eng(modes={"dim": "2D", **bad}).pull("N")
+            raise AssertionError(f"an unknown {key} must raise")
+        except ValueError as exc:
+            assert "bogus" in str(exc)
+    # 0 is the size filter's OFF sentinel, so a SUB-VOXEL upper bound would quantize to
+    # "no upper limit" and keep everything instead of dropping all but specks — the exact
+    # inversion analysis.histogram_threshold already refuses. (A sub-voxel LOWER bound is
+    # harmless: every object has at least one voxel, so it filters nothing either way.)
+    for dim, key, val in (("2D", "max_area", 0.1), ("3D", "max_volume", 0.1)):
+        try:
+            eng(modes={"dim": dim, "method": "threshold"}, params={key: val}).pull("N")
+            raise AssertionError(f"a sub-voxel {key} must raise, not invert the filter")
+        except ValueError as exc:
+            assert "under one voxel" in str(exc), str(exc)
+    _, _, rsub, _ = seg(modes={"dim": "2D", "method": "threshold"},
+                        params={"min_area": 0.1})
+    assert int(rsub.max()) == 9, "a sub-voxel min_area is a vacuous filter, not an error"
+    try:
+        eng(modes={"dim": "2D", "method": "threshold"},
+            params={"min_area": 20.0, "max_area": 5.0}).pull("N")
+        raise AssertionError("an empty size window must raise")
+    except ValueError as exc:
+        assert "size window is empty" in str(exc)
+
+    # ── CellSAM: the glue, against a stubbed package ──────────────────────────
+    import os
+    import sys
+    import nodegraph.kernels.cellsam_segment as CS
+
+    # absent (this env): the node must raise the friendly install hint, not a bare
+    # ModuleNotFoundError from three frames down.
+    if not CS.cellsam_available():
+        try:
+            eng(modes={"dim": "2D", "method": "cellsam"}).pull("N")
+            raise AssertionError("cellsam must refuse when the package is absent")
+        except ImportError as exc:
+            assert "pip install" in str(exc) and "DEEPCELL_ACCESS_TOKEN" in str(exc), \
+                "the hint must name both the package and the model-token requirement"
+    assert CS.resolve_device("cpu") == "cpu", "cpu must not even import torch"
+
+    _saved = {k: sys.modules[k] for k in ("cellSAM", "cellSAM.wsi") if k in sys.modules}
+    _dev = os.environ.get(CS.DEVICE_ENV)
+    os.environ[CS.DEVICE_ENV] = "cpu"                # keep the gate torch-free
+    try:
+        calls = []
+        _stub_cellsam(calls)
+        CS._reset_model_cache()
+        _, outc, rc2, cc = seg(modes={"dim": "2D", "method": "cellsam"},
+                               params={"bbox_threshold": 0.25,
+                                       "cellsam_model": "cellsam_extra"})
+        assert [c for c in calls if c[0] == "load"] == [("load", "cellsam_extra")], \
+            "the checkpoint must be read ONCE per pull, not once per plane"
+        assert sum(c[0] == "seg" for c in calls) == 3, "one call per (m,t,z,c) plane"
+        assert {c[1] for c in calls if c[0] == "seg"} == {0.25}, "bbox_threshold forwarded"
+        assert int(rc2.max()) == 6 and sorted(cc["id"].tolist()) == list(range(1, 7)), \
+            "3 planes x 2 objects, ids offset into a globally-unique range"
+        assert sorted(cc["area"].tolist()) == [4, 4, 4, 15, 15, 15], \
+            "upstream's non-contiguous ids (9, 4) relabel to 1..K with the areas intact"
+        assert outc.metadata.get("segment_method") == "cellsam"
+        assert outc.metadata.get("segment_model") == "cellsam_extra", "provenance stamp"
+        # the shared postprocess applies to a learned method exactly as to a classical one
+        _, _, _, ccf = seg(modes={"dim": "2D", "method": "cellsam"},
+                           params={"fill_holes": True})
+        assert sorted(ccf["area"].tolist()) == [4, 4, 4, 16, 16, 16], \
+            "fill_holes must close the hole in the model's mask too (15 -> 16)"
+        _, _, _, ccm = seg(modes={"dim": "2D", "method": "cellsam"},
+                           params={"min_area": 2.0})
+        assert sorted(ccm["area"].tolist()) == [15, 15, 15], \
+            "2 µm² = 8 px² drops the 4-px object — the physical filter is shared"
+        # a local checkpoint bypasses the download+token path, and the provenance must name
+        # the checkpoint that actually ran (model_path WINS inside the kernel)
+        calls.clear(); CS._reset_model_cache()
+        _, outw, _, _ = seg(modes={"dim": "2D", "method": "cellsam"},
+                            params={"model_path": "w.pt",
+                                    "cellsam_model": "cellsam_extra"})
+        assert ("local", "w.pt") in calls, "`model_path` must use get_local_model"
+        assert not any(c[0] == "load" for c in calls), "…and never the published model"
+        assert outw.metadata.get("segment_model") == "w.pt", \
+            "provenance must name the local checkpoint, not the ignored model socket"
+        # tiling routes through cellSAM.wsi with iou_depth == overlap (upstream needs <=)
+        wsi_log = []
+        calls.clear(); _stub_cellsam(calls, log=wsi_log); CS._reset_model_cache()
+        seg(modes={"dim": "2D", "method": "cellsam"},
+            params={"tile": True, "tile_size": 128, "tile_overlap": 24})
+        assert wsi_log and wsi_log[0][:3] == (128, 24, 24), \
+            "tile_size/overlap forwarded; iou_depth mirrors overlap"
+        # Both upstream no-cells failures must land as an EMPTY segmentation, not a crash.
+        # This is the path a blank plane / an empty FOV / the dark end slices of a z-stack
+        # take on every real run, so it is the difference between "the stack segments" and
+        # "the whole pull dies on slice 0".
+        for mode, why in (("attr", "the real (None,)*4 AttributeError, upstream #98"),
+                          ("shape", "upstream's own mis-shaped (C,H,W) empty branch")):
+            calls.clear(); _stub_cellsam(calls, nocells=mode); CS._reset_model_cache()
+            _, outn, rn, cn = seg(modes={"dim": "2D", "method": "cellsam"})
+            assert int(rn.max()) == 0 and rn.shape == (1, 1, 3, 1, Y, X), why
+            assert cn["id"] is None or len(cn["id"]) == 0, f"rows emitted for {why}"
+        # ...but an unrelated AttributeError must still propagate — the absorb is narrow
+        calls.clear(); _stub = _stub_cellsam(calls); CS._reset_model_cache()
+        _stub.segment_cellular_image = lambda *a, **k: (_ for _ in ()).throw(
+            AttributeError("'Foo' object has no attribute 'bar'"))
+        try:
+            seg(modes={"dim": "2D", "method": "cellsam"})
+            raise AssertionError("an unrelated AttributeError must not be swallowed")
+        except AttributeError as exc:
+            assert "Foo" in str(exc)
+    finally:
+        for k in ("cellSAM", "cellSAM.wsi"):
+            sys.modules.pop(k, None)
+        sys.modules.update(_saved)
+        if _dev is None:
+            os.environ.pop(CS.DEVICE_ENV, None)
+        else:
+            os.environ[CS.DEVICE_ENV] = _dev
+        CS._reset_model_cache()
+
+    # StarDist is NOT run here, by the same policy as before the fold-in: loading the
+    # pretrained TF model costs seconds and hits the network, which does not belong in the
+    # fast gate. Its socket set and gating are covered structurally above, and the compute
+    # is audited by test_param_socket_contract.
+    _ok("segmentation: one image->Label contract, 4 methods behind a Mode (threshold/"
+        "watershed 2D+3D run; stardist spec-only; cellsam glue on a stub, incl. BOTH "
+        "upstream no-cells failures absorbed to an empty plane + an unrelated one still "
+        "raised) — per-method socket + Mode gating, watershed splits what CCL merges "
+        "(plateau markers merged, border exclusion off so z<=2 and frame-edge objects "
+        "survive), "
+        "shared fill/µm²+µm³ filter/global ids/table, px+z fences, 16 distinct "
+        "method×dim×level hashes, 5 refusals (3D lever on a 2D-only method, missing "
+        "foreground layer, unknown method/level, sub-voxel + empty size window)")
+
+
+
 # ── the param<->socket contract (catalog-wide structural guard, 2026-07-28) ─────
 
 #: Params a compute reads that legitimately have NO socket. Every entry needs a reason;
@@ -4787,6 +5275,25 @@ def test_param_socket_contract() -> None:
         if getattr(fn, "__module__", "") != "nodegraph.nodes":
             continue
         mode_names = {m.name: set(m.choices) for m in spec.modes}
+        # (a0) a MODE may be gated on another Mode's value too (V2.12 `ModeSpec.
+        #      available_in`), and the same typo hides it in every state — with no socket
+        #      list to notice its absence. A mode must never gate on ITSELF, which would
+        #      make its own visibility depend on the value it is choosing.
+        for mo in spec.modes:
+            mtag = "%s![%s]" % (spec.op_key, mo.name)
+            for mname, allowed in (mo.available_in or {}).items():
+                if mname == mo.name:
+                    bad_layer.append("%s: a Mode cannot gate on itself" % mtag)
+                    continue
+                if mname not in mode_names:
+                    bad_layer.append("%s: available_in names mode %r that does not exist"
+                                     % (mtag, mname))
+                    continue
+                unknown = set(allowed) - mode_names[mname]
+                if unknown:
+                    bad_layer.append("%s: available_in[%r] has values %s not in %s"
+                                     % (mtag, mname, sorted(unknown),
+                                        sorted(mode_names[mname])))
         for so in spec.inputs:
             tag = "%s.%s" % (spec.op_key, so.name)
             # (a) available_in must reference modes and VALUES that exist — a typo here
@@ -4845,7 +5352,10 @@ def test_param_socket_contract() -> None:
                     "the default is declared once" % (tag, so.name, so.name))
 
     assert not bad_layer, "layer-socket contract violations:\n  " + "\n  ".join(bad_layer)
-    assert n_in >= 18 and n_out >= 19, \
+    # V2.12: `analysis.watershed` + `detect.stardist_nuclei` folded into
+    # `analysis.segment` - the catalog lost one layer_in and two layer_out
+    # sockets and gained one of each.
+    assert n_in >= 18 and n_out >= 18, \
         "only %d layer_in / %d layer_out sockets — a declaration was lost" % (n_in, n_out)
 
     # The resolver MUST see through every indirection the catalog uses, or this guard
@@ -4859,7 +5369,8 @@ def test_param_socket_contract() -> None:
     assert "min_radius_z" in keys_of("_compute_spots"), \
         "ctx.params[\"X\"] subscript read not resolved"
 
-    assert audited >= 55, f"only {audited} catalog computes audited — index broke"
+    # 54 after V2.12 folded two segmentation nodes into `analysis.segment` (was 55)
+    assert audited >= 54, f"only {audited} catalog computes audited — index broke"
     _ok("socket contract: all %d catalog node types — (1) every param a compute reads "
         "has a socket, (2) every socket is read (helper-forwarded, suffixed `_z`, "
         "transitive, per-channel and ctx.layer keys resolved), (3) %d layer_in + %d "
@@ -4992,7 +5503,7 @@ def test_layer_catalog() -> None:
             n_out += 1
             assert so.type is SocketType.STRING, f"{spec.op_key}.{so.name} must be STRING"
             assert all(isinstance(d, Domain) for d in so.layer_out)
-    assert n_out >= 19, f"only {n_out} layer_out sockets — a producer lost its declaration"
+    assert n_out >= 18, f"only {n_out} layer_out sockets — a producer lost its declaration"
 
     # TOTALITY: propagate_meta runs on every keystroke and its GUI caller catches only
     # ValueError, so a junk param must degrade, never raise.
@@ -5062,6 +5573,7 @@ def main() -> int:
     test_cluster_points()
     test_mesh_domain()
     test_tessellate_split()
+    test_segment()
     test_param_socket_contract()
     test_layer_catalog()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")

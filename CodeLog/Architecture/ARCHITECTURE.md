@@ -1,5 +1,13 @@
 # NodeLab — Architecture
 
+> ## ⚠️ SUPERSEDED 2026-07-29 — this describes the REMOVED first-generation app.
+> `nodelab/` and the vendored `nd2studios`/`pipeline_kit` backend were deleted on
+> 2026-07-29 (record: [../ClaudesPlan/V2.05_phase7_capability_matrix.md](../ClaudesPlan/V2.05_phase7_capability_matrix.md)
+> §6). Every path, module and invariant below is gone. The current architecture is
+> **[ENGINEERING_NOTES.md](ENGINEERING_NOTES.md)** (the `nodegraph` engine +
+> `nodelab_v2` GUI); the user-facing guide is [../../MANUAL.md](../../MANUAL.md).
+> This file is kept only as history.
+
 NodeLab is a thin, well-layered PySide6 GUI over the vendored, Qt-free
 `nd2studios.pipeline_kit` backend. All Qt lives in `nodelab/`; the backend is a
 copy consumed only through its public API.
