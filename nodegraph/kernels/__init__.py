@@ -16,9 +16,12 @@ around the third-party ``cellSAM`` package, V2.12) — the latter in the same "e
 wrapper" class as ``stardist_segment`` and ``dic_correlate``, which hold no algorithm
 either.
 
-Optional deps in this env: ``scikit-learn``, ``al-dic``, ``tensorflow``/``stardist``,
-``torch`` AND ``cellSAM`` are all present, with the CellSAM weights cached under
-``~/.deepcell/models`` — so every method of ``analysis.segment`` runs here. NOTE for anyone
-debugging a model download on this machine: HTTPS is intercepted by antivirus, which Python
-3.13 rejects outright; see ``cellsam_segment.md`` §8.
+Optional deps, each gated at its own call site so the palette registers without any of them:
+``scikit-learn`` (point clustering), ``al-dic`` (DIC), ``tensorflow``/``stardist`` and
+``cellSAM``/``torch`` (the two learned Segmentation methods), ``numba``/``pandas``
+(tracking), ``cupy`` (a GPU FFT seed). The learned methods additionally need model WEIGHTS,
+which are a separate failure mode from a missing package: run
+``python scripts/setup_cellsam.py`` once per machine for CellSAM. If a weights download
+fails with a certificate error while your browser and ``pip`` work, your network intercepts
+HTTPS — see ``cellsam_segment.md`` §8, which that script also handles.
 """
