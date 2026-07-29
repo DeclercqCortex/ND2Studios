@@ -91,6 +91,18 @@ never consulted again, including from the GUI, because `get_model()` returns ear
 > retries automatically. This was the actual experience on the development machine (Norton
 > HTTPS scanning) — see [`nodegraph/kernels/cellsam_segment.md`](nodegraph/kernels/cellsam_segment.md) §8.
 
+**Once the weights are on disk, CellSAM needs neither a token nor a network** — verified
+with the token removed from the environment and a socket-level tripwire armed: 0 network
+calls, model load + segmentation unaffected. That applies to the GUI too, which runs the
+same kernel.
+
+**Second machine, no token at all.** The weights directory is portable. Copy
+`~/.deepcell/models/cellsam_v<ver>/` (or just `cellsam_general.pt`) to the other machine
+and either drop it at the same path, or point the node's **`model_path`** socket at the
+file — that calls `get_local_model` and skips the download, the token and the network
+entirely. Verified to give bit-identical results to the downloaded copy. Respect the
+non-commercial academic licence when you copy them.
+
 Reference timings on a CPU-only torch build: model load ~1.5 s, then ~10 s per image
 (matching the paper's benchmark; cost scales with cell count because the mask decoder runs
 once per detected cell). A CUDA torch build is picked up automatically

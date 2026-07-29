@@ -67,7 +67,11 @@ def _token_instructions() -> str:
             "     (the models are licensed for NON-COMMERCIAL ACADEMIC use)\n"
             "  2. set it — paste the token BARE, with no <>, quotes or spaces:\n"
             + setit
-            + "  3. re-run this script")
+            + "  3. re-run this script\n"
+            "\nNO TOKEN AVAILABLE? The weights directory is portable: copy\n"
+            "  ~/.deepcell/models/cellsam_v<ver>/  from a machine that already has it,\n"
+            "or point the node's `model_path` socket at a single .pt. Either route needs\n"
+            "no token and no network (mind the non-commercial academic licence).")
 
 
 def _weight_files(version: str) -> list:
