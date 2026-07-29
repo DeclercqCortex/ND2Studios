@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# NodeLab / ND2Studios outputs
+results/
+*.nd2s
+*.nd2s_pipeline.json.bak
+
+# Local sample data (large microscopy files — never commit)
+sample_data/
+*.nd2
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

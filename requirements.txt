@@ -1,0 +1,23 @@
+# NodeLab — the ND2Studios node editor (the `nodegraph` engine + its PySide6 GUI).
+
+PySide6>=6.5
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+PyWavelets>=1.4    # via skimage.restoration.denoise_wavelet (enhance.wavelet_denoise)
+opencv-python>=4.8 # registration.stabilize (feature/affine estimation)
+
+# Image I/O + the lazy storage layer the streaming engine pulls through.
+nd2>=0.10          # ND2 ingest
+dask>=2024.1       #   └─ via nd2.ND2File.to_dask() — the frame-wise read path segfaults
+tifffile>=2023.7   # TIFF ingest
+blosc2>=3.0        # in-memory / on-disk planar-block .b2nd stores (B2ndProvider)
+pyarrow>=15.0      # Parquet / Arrow export + structure tables (lazily imported)
+
+# ── OPTIONAL, feature-gated at import: the app launches and the whole palette
+#    registers without these; the relevant node raises an install hint when pulled ──
+#   pip install scikit-learn                 # analysis.cluster_points (GMM / KMeans+BIC)
+#   pip install numba pandas                 # track.objects (the 5-method tracker)
+#   pip install al-dic                       # analysis.dic_correlate (2D DIC, pyALDIC)
+#   pip install stardist tensorflow csbdeep  # detect.stardist_nuclei
+#   pip install zarr                         # scripts/_bench_provider_granularity.py only
